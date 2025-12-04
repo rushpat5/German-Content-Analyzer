@@ -31,8 +31,8 @@ st.markdown("""
     .stTextInput input { background-color: #ffffff !important; border: 1px solid #d0d7de !important; color: #24292e !important; }
     #MainMenu {visibility: hidden;} footer {visibility: hidden;}
     
-    /* Cluster Styling */
     .cluster-box { border: 1px solid #e1e4e8; background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 10px; }
+    .tech-note { font-size: 0.85rem; color: #57606a; background-color: #f6f8fa; border-left: 3px solid #0969da; padding: 12px; border-radius: 0 4px 4px 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -50,10 +50,6 @@ def load_gemma_model(hf_token):
         return None
 
 def filter_and_cluster_gemma(df_keywords, seeds, threshold, hf_token):
-    """
-    1. Filters keywords against seeds using Gemma.
-    2. Clusters the survivors into topic groups.
-    """
     model = load_gemma_model(hf_token)
     if not model: return df_keywords
     
@@ -64,7 +60,7 @@ def filter_and_cluster_gemma(df_keywords, seeds, threshold, hf_token):
     candidates = df_keywords['German Keyword'].tolist()
     candidate_vecs = model.encode(candidates, prompt_name="STS", normalize_embeddings=True)
     
-    # Compare every candidate to every seed, take max
+    # Compare candidates to seeds
     scores_matrix = util.cos_sim(candidate_vecs, seed_vecs)
     max_scores, _ = torch.max(scores_matrix, dim=1)
     
@@ -72,15 +68,14 @@ def filter_and_cluster_gemma(df_keywords, seeds, threshold, hf_token):
     df_filtered = df_keywords[df_keywords['Relevance'] >= threshold].copy()
     
     if len(df_filtered) < 2:
-        return df_filtered # Too few to cluster
+        return df_filtered 
 
     # --- STEP 2: CLUSTERING ---
-    # Re-encode for clustering using the "Clustering" prompt
     cluster_vecs = model.encode(df_filtered['German Keyword'].tolist(), prompt_name="Clustering", normalize_embeddings=True)
     
     clustering = AgglomerativeClustering(
         n_clusters=None, 
-        distance_threshold=0.8, # Gemma specific threshold
+        distance_threshold=0.85, 
         metric='euclidean', 
         linkage='ward'
     )
@@ -98,20 +93,46 @@ def filter_and_cluster_gemma(df_keywords, seeds, threshold, hf_token):
     return df_filtered.sort_values('Cluster ID')
 
 # -----------------------------------------------------------------------------
-# 3. GENERATIVE ENGINE
+# 3. GENERATIVE ENGINE (Dynamic & Robust)
 # -----------------------------------------------------------------------------
 
-def run_gemini(api_key, prompt):
+def get_working_model_name(api_key):
+    """Automatically finds a model your API key has access to."""
     genai.configure(api_key=api_key)
-    candidates = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
-    for m in candidates:
-        try:
-            model = genai.GenerativeModel(m)
-            response = model.generate_content(prompt)
-            text = response.text.replace("```json", "").replace("```", "").strip()
-            return json.loads(text)
-        except: continue
-    return {"error": "AI Failed"}
+    try:
+        models = list(genai.list_models())
+        # Filter for generating content
+        valid_models = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+        
+        if not valid_models: return "models/gemini-1.5-flash"
+        
+        # Priority 1: Flash 1.5
+        for m in valid_models:
+            if 'flash' in m and '1.5' in m: return m
+        # Priority 2: Pro 1.5
+        for m in valid_models:
+            if 'pro' in m and '1.5' in m: return m
+            
+        return valid_models[0] # Fallback to whatever is available
+    except:
+        return "models/gemini-1.5-flash"
+
+def run_gemini(api_key, prompt):
+    try:
+        model_name = get_working_model_name(api_key)
+        model = genai.GenerativeModel(model_name)
+        
+        response = model.generate_content(prompt)
+        text = response.text
+        
+        # Clean Markdown wrappers
+        if "```" in text:
+            text = re.sub(r"```json|```", "", text).strip()
+            
+        return json.loads(text)
+    except Exception as e:
+        # Return the actual error message for debugging
+        return {"error": str(e)}
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
@@ -123,14 +144,20 @@ def get_cultural_translation(api_key, keyword):
 
 def batch_translate(api_key, keywords):
     if not keywords: return {}
-    chunks = [keywords[i:i+50] for i in range(0, len(keywords), 50)]
+    # Chunking
+    chunks = [keywords[i:i+40] for i in range(0, len(keywords), 40)]
     full_map = {}
-    for chunk in chunks:
+    
+    progress_text = st.empty()
+    for i, chunk in enumerate(chunks):
+        progress_text.caption(f"Translating batch {i+1}/{len(chunks)}...")
         prompt = f"""Translate German to English (Literal): {json.dumps(chunk)}. 
         Return JSON: {{ "German": "English" }}"""
         res = run_gemini(api_key, prompt)
         if "error" not in res: full_map.update(res)
-        time.sleep(0.2)
+        time.sleep(0.5) # Safety sleep for rate limits
+        
+    progress_text.empty()
     return full_map
 
 def generate_brief(api_key, cluster_name, keywords):
@@ -199,6 +226,12 @@ with st.sidebar:
     
     st.markdown("---")
     threshold = st.slider("Similarity Threshold", 0.0, 1.0, 0.50, 0.05)
+    
+    st.markdown("""
+    <div class="tech-note">
+    <b>Dynamic AI:</b> Engine automatically finds valid models for your API Key region.
+    </div>
+    """, unsafe_allow_html=True)
 
 st.title("German SEO Strategist 🇩🇪")
 st.markdown("### Strategy Generator (Gemma + Clustering)")
@@ -216,8 +249,13 @@ if run_btn and keyword and api_key and hf_token:
     # 1. Strategy
     with st.spinner("Analyzing Linguistics..."):
         strategy = get_cultural_translation(api_key, keyword)
+        
+        # ERROR HANDLING DISPLAY
         if not strategy or "error" in strategy:
-            st.error("AI Error."); st.stop()
+            err_msg = strategy.get('error') if strategy else "Unknown Error"
+            st.error(f"AI Connection Failed: {err_msg}")
+            st.info("Tip: Check if your API Key has access to 'Gemini Flash' or 'Pro'.")
+            st.stop()
     
     synonyms = strategy.get('synonyms', [])
     st.info(f"**Cultural Context:** {strategy.get('explanation')}")
@@ -264,11 +302,13 @@ if run_btn and keyword and api_key and hf_token:
                                     st.caption(f"({brief.get('h1_english')})")
                                     for s in brief.get('outline', []):
                                         st.markdown(f"- {s.get('h2')}")
+                                else:
+                                    st.error(f"Brief Failed: {brief.get('error')}")
         
         with tab2:
             st.dataframe(df_clustered, use_container_width=True)
             csv = df_clustered.to_csv(index=False).encode('utf-8')
-            st.download_button("Download CSV", csv, "german_strategy.csv", "text/csv")
+            st.download_button("Download CSV", csv, "german_gemma_clusters.csv", "text/csv")
             
     else:
         st.warning("No keywords found.")
