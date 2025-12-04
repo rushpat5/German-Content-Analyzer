@@ -38,37 +38,77 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. LOGIC ENGINE
+# 2. LOGIC ENGINE (Dynamic & Robust)
 # -----------------------------------------------------------------------------
 
-def run_gemini_prompt(api_key, prompt):
+def get_best_model_name(api_key):
+    """
+    Dynamically asks Google which models are available to this Key
+    and selects the best one for text generation.
+    """
     genai.configure(api_key=api_key)
-    candidates = ["gemini-1.5-flash", "gemini-1.5-flash-latest", "gemini-1.5-pro", "gemini-pro"]
-    last_error = None
-    for model_name in candidates:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            text = response.text
-            if "```" in text: text = re.sub(r"```json|```", "", text).strip()
-            return json.loads(text)
-        except Exception as e:
-            last_error = e
-            time.sleep(1)
-            continue
-    raise Exception(f"AI Models Failed: {str(last_error)}")
+    try:
+        # 1. List models
+        models = list(genai.list_models())
+        
+        # 2. Filter for text generation capability
+        valid_models = [m for m in models if 'generateContent' in m.supported_generation_methods]
+        
+        # 3. Priority Selection Strategy
+        # Priority A: Flash 1.5 (Fastest/Cheapest)
+        for m in valid_models:
+            if 'flash' in m.name and '1.5' in m.name: return m.name
+            
+        # Priority B: Pro 1.5 (Smartest)
+        for m in valid_models:
+            if 'pro' in m.name and '1.5' in m.name: return m.name
+            
+        # Priority C: Any Gemini
+        for m in valid_models:
+            if 'gemini' in m.name: return m.name
+            
+        # Fallback if list is empty but auth passed (rare)
+        return "models/gemini-1.5-flash"
+        
+    except Exception as e:
+        # If listing fails (often due to API key permissions), force a standard default
+        return "models/gemini-1.5-flash"
+
+def run_gemini_prompt(api_key, prompt):
+    try:
+        # Dynamically find the working model name
+        model_name = get_best_model_name(api_key)
+        
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(prompt)
+        
+        text = response.text
+        if "```" in text:
+            text = re.sub(r"```json|```", "", text).strip()
+            
+        return json.loads(text)
+    except Exception as e:
+        # Raise error to be caught by caller
+        raise Exception(f"Model Error ({model_name}): {str(e)}")
 
 def get_synonyms_strategy(api_key, keyword):
     prompt = f"""
     Act as a Native German SEO Expert.
     English Keyword: "{keyword}"
+    
     Task: Identify the top 3 distinct German terms used for this concept. 
-    1. The most common colloquial term.
+    1. The most common colloquial term (what real people type).
     2. The formal/medical term.
     3. A popular synonym.
-    Return raw JSON: {{ "synonyms": ["term1", "term2", "term3"], "explanation": "Reasoning" }}
+    
+    Return raw JSON:
+    {{
+        "synonyms": ["term1", "term2", "term3"],
+        "explanation": "Brief reasoning"
+    }}
     """
-    try: return run_gemini_prompt(api_key, prompt)
+    try:
+        return run_gemini_prompt(api_key, prompt)
     except Exception as e:
         st.error(f"AI Error: {str(e)}")
         return None
@@ -76,6 +116,8 @@ def get_synonyms_strategy(api_key, keyword):
 def batch_translate_full(api_key, all_keywords):
     if not all_keywords: return {}
     full_map = {}
+    
+    # Chunk size 40 to be safe
     chunks = [all_keywords[i:i + 40] for i in range(0, len(all_keywords), 40)]
     
     prog_text = st.empty()
@@ -90,6 +132,8 @@ def batch_translate_full(api_key, all_keywords):
             res = run_gemini_prompt(api_key, prompt)
             full_map.update(res)
         except: continue
+        time.sleep(0.5)
+        
     prog_text.empty()
     return full_map
 
@@ -104,6 +148,7 @@ def fetch_suggestions(query):
 def deep_mine_synonyms(synonyms):
     modifiers = ["", " für", " bei", " gegen", " was", " wann", " hausmittel", " kosten", " kaufen"]
     all_data = []
+    
     p_bar = st.progress(0, text="Mining Google...")
     total = len(synonyms) * len(modifiers)
     step = 0
@@ -114,19 +159,20 @@ def deep_mine_synonyms(synonyms):
             p_bar.progress(min(step / total, 1.0), text=f"Mining: '{seed}{mod}'...")
             
             results = fetch_suggestions(f"{seed}{mod}")
+            
             intent = "General"
             if "für" in mod: intent = "Use Case"
             elif "gegen" in mod: intent = "Solution"
             elif "hausmittel" in mod: intent = "DIY"
             elif "kaufen" in mod: intent = "Transactional"
+            elif "wann" in mod or "was" in mod: intent = "Informational"
             
             for r in results:
                 all_data.append({
                     "German Keyword": r,
                     "Seed Term": seed,
                     "Intent": intent,
-                    # Add length for sorting later (shorter = usually higher volume)
-                    "Length": len(r)
+                    "Length": len(r) # For sorting priority
                 })
             time.sleep(0.1)
             
@@ -175,6 +221,17 @@ def fetch_smart_trends(df_keywords):
             
     prog_text.empty()
     return trend_map
+
+def get_google_trends_single(keyword):
+    """Fetches trend for the main chart."""
+    try:
+        pytrends = TrendReq(hl='de-DE', tz=360)
+        pytrends.build_payload([keyword], cat=0, timeframe='today 12-m', geo='DE')
+        time.sleep(0.5)
+        data = pytrends.interest_over_time()
+        if not data.empty: return data.drop(columns=['isPartial'])
+    except: return None
+    return None
 
 # -----------------------------------------------------------------------------
 # 3. SIDEBAR
@@ -238,9 +295,20 @@ if run_btn and keyword and api_key:
             cols = st.columns(len(synonyms))
             for i, syn in enumerate(synonyms):
                 cols[i].markdown(f"""<div class="metric-card"><div class="metric-val">{syn}</div></div>""", unsafe_allow_html=True)
-                
+            
+            # 5. Main Trend Chart
             st.markdown("---")
-            st.subheader(f"2. The Master Matrix")
+            st.subheader(f"2. Demand Trend: '{synonyms[0]}'")
+            trend_data = get_google_trends_single(synonyms[0])
+            if trend_data is not None:
+                fig = px.line(trend_data, y=synonyms[0], title=f"Relative Interest (Last 12 Months)", color_discrete_sequence=['#1a7f37'])
+                fig.update_layout(plot_bgcolor='white', yaxis=dict(gridcolor='#f0f0f0'))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Trend data unavailable (Google Trends API limit or low volume).")
+
+            st.markdown("---")
+            st.subheader(f"3. The Master Matrix")
             st.caption("Top Keywords checked against Google Trends (0-100 Scale). 'N/A' means the keyword was too long-tail to prioritize for the trend check.")
             
             # Sort: High Trend Score first, then Shortest words (likely highest volume)
