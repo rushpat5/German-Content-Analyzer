@@ -22,59 +22,53 @@ st.markdown("""
     .stApp { background-color: #ffffff; color: #24292e; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
     h1, h2, h3 { color: #111; font-weight: 600; letter-spacing: -0.5px; }
     
-    /* Cards */
     .metric-card { background: #ffffff; border: 1px solid #e1e4e8; border-radius: 8px; padding: 20px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.02); }
     .metric-val { font-size: 1.5rem; font-weight: 700; color: #1a7f37; margin-bottom: 5px; }
     .metric-lbl { font-size: 0.8rem; color: #586069; text-transform: uppercase; letter-spacing: 0.5px; }
     
-    /* Clusters */
-    .cluster-box { border: 1px solid #d0d7de; border-radius: 6px; padding: 15px; margin-bottom: 15px; background: #fcfcfc; }
-    .cluster-header { font-weight: 700; font-size: 1.1rem; color: #0969da; border-bottom: 1px solid #eaecef; padding-bottom: 8px; margin-bottom: 8px; }
-    
     section[data-testid="stSidebar"] { background-color: #f6f8fa; border-right: 1px solid #d0d7de; }
     .stTextInput input { background-color: #ffffff !important; border: 1px solid #d0d7de !important; color: #24292e !important; }
     #MainMenu {visibility: hidden;} footer {visibility: hidden;}
+    
+    /* Cluster Styling */
+    .cluster-box {
+        border: 1px solid #e1e4e8; background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. VECTOR ENGINE (For Clustering)
+# 2. VECTOR ENGINE (Clustering)
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def load_embedding_model():
-    # Multilingual model crucial for German semantics
     return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 
 def cluster_keywords(df_keywords):
-    """
-    Groups keywords by semantic meaning using Vector Embeddings.
-    """
     if len(df_keywords) < 3:
         df_keywords['Cluster'] = "Single Topic"
         return df_keywords
 
     model = load_embedding_model()
     
-    # 1. Vectorize German Keywords
+    # Vectorize
     embeddings = model.encode(df_keywords['German Keyword'].tolist())
     
-    # 2. Cluster (Agglomerative is better for small datasets than K-Means)
-    # Distance threshold determines how "tight" the groups are
+    # Cluster
     clustering = AgglomerativeClustering(
         n_clusters=None, 
-        distance_threshold=1.5, # Tweak this for tighter/looser groups
+        distance_threshold=1.5, 
         metric='euclidean', 
         linkage='ward'
     )
     cluster_ids = clustering.fit_predict(embeddings)
-    
     df_keywords['Cluster ID'] = cluster_ids
     
-    # 3. Name the Clusters (Find the shortest keyword in the group as the "Head")
+    # Name Clusters
     cluster_names = {}
     for cid in np.unique(cluster_ids):
         subset = df_keywords[df_keywords['Cluster ID'] == cid]
-        # Heuristic: Shortest keyword usually represents the broad topic
+        # Head term is usually the shortest
         head_term = sorted(subset['German Keyword'].tolist(), key=len)[0]
         cluster_names[cid] = head_term.title()
         
@@ -82,30 +76,39 @@ def cluster_keywords(df_keywords):
     return df_keywords.sort_values('Cluster ID')
 
 # -----------------------------------------------------------------------------
-# 3. GENERATIVE ENGINE (Gemini)
+# 3. GENERATIVE ENGINE (Brute Force Selector)
 # -----------------------------------------------------------------------------
 
-def get_valid_model(api_key):
-    genai.configure(api_key=api_key)
-    try:
-        models = list(genai.list_models())
-        valid = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        for m in valid:
-            if 'flash' in m and '1.5' in m: return m
-        return "models/gemini-pro"
-    except: return "models/gemini-1.5-flash"
-
 def run_gemini(api_key, prompt):
-    model_name = get_valid_model(api_key)
-    try:
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(prompt)
-        text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
-    except Exception as e:
-        # Return raw text if JSON parse fails, formatted as error dict
-        if "429" in str(e): return {"error": "Quota Exceeded"}
-        return {"error": str(e)}
+    genai.configure(api_key=api_key)
+    
+    # List of models to try (Priority order)
+    candidates = [
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-pro",
+        "gemini-1.0-pro",
+        "gemini-pro"
+    ]
+    
+    last_err = ""
+    
+    for model_name in candidates:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            
+            # Clean Markdown
+            text = response.text.replace("```json", "").replace("```", "").strip()
+            # Fix common JSON trailing commas errors if any
+            return json.loads(text)
+        except Exception as e:
+            last_err = str(e)
+            # If quota error (429), wait a bit and try next
+            if "429" in str(e): time.sleep(1)
+            continue
+            
+    return {"error": f"All models failed. Last error: {last_err}"}
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
@@ -123,41 +126,45 @@ def get_cultural_translation(api_key, keyword):
 
 def batch_validate_translate(api_key, keywords, topic):
     if not keywords: return {}
-    chunks = [keywords[i:i + 40] for i in range(0, len(keywords), 40)]
-    full_map = {}
     
-    for chunk in chunks:
+    full_map = {}
+    chunks = [keywords[i:i + 30] for i in range(0, len(keywords), 30)]
+    
+    prog_text = st.empty()
+    
+    for i, chunk in enumerate(chunks):
+        prog_text.caption(f"AI analyzing batch {i+1}/{len(chunks)}...")
         prompt = f"""
-        Topic: "{topic}"
-        Input Keywords: {json.dumps(chunk)}
+        Context Topic: "{topic}"
+        Keywords: {json.dumps(chunk)}
         
         Task:
         1. Translate to English.
-        2. Mark "keep": false if it is a Brand Name (e.g. DM, Rossmann), Store, or Off-Topic.
+        2. "keep": false if it is a Brand Name (e.g. DM, Rossmann, Amazon), a specific Store, or completely Off-Topic.
         
         Return JSON: {{ "german_word": {{ "en": "english", "keep": true }} }}
         """
-        try:
-            res = run_gemini(api_key, prompt)
-            if "error" not in res: full_map.update(res)
-            time.sleep(0.5)
-        except: continue
+        res = run_gemini(api_key, prompt)
+        if "error" not in res:
+            full_map.update(res)
+        time.sleep(0.2)
+        
+    prog_text.empty()
     return full_map
 
 def generate_content_brief(api_key, cluster_name, keywords):
     prompt = f"""
-    Act as a Content Strategist for the German Market.
+    Act as a Content Strategist.
     Target Topic: "{cluster_name}"
-    Keywords to Cover: {", ".join(keywords)}
+    Keywords: {", ".join(keywords)}
     
-    Create a Content Brief.
+    Create a brief for a German article.
     Return JSON:
     {{
-        "h1_german": "Optimized H1 in German",
-        "h1_english": "English translation",
-        "user_intent": "Informational/Commercial/Transactional",
+        "h1_german": "Optimized H1",
+        "h1_english": "Translation",
         "outline": [
-            {{ "h2": "German H2", "intent": "What to cover here" }}
+            {{ "h2": "German H2", "intent": "Content notes" }}
         ]
     }}
     """
@@ -175,11 +182,9 @@ def fetch_suggestions(query):
     return []
 
 def deep_mine(synonyms):
-    # Recursive Alphabet Soup
     modifiers = ["", " für", " bei", " gegen", " was", " wann", " hausmittel", " anleitung", " kaufen"]
     all_data = []
     
-    # UI Progress
     prog = st.progress(0, "Mining Google Germany...")
     total = len(synonyms) * len(modifiers)
     step = 0
@@ -190,10 +195,16 @@ def deep_mine(synonyms):
             prog.progress(min(step/total, 1.0), f"Mining: {seed}{mod}...")
             
             results = fetch_suggestions(f"{seed}{mod}")
+            
+            intent = "Informational"
+            if "kaufen" in mod: intent = "Transactional"
+            elif "gegen" in mod: intent = "Solution"
+            
             for r in results:
                 all_data.append({
                     "German Keyword": r, 
                     "Seed": seed,
+                    "Intent": intent,
                     "Length": len(r)
                 })
             time.sleep(0.05)
@@ -211,16 +222,12 @@ def fetch_smart_trends(df_keywords):
     
     try:
         pytrends = TrendReq(hl='de-DE', tz=360)
-        # Batch of 5
-        for i in range(0, len(candidates), 5):
-            batch = candidates[i:i+5]
-            pytrends.build_payload(batch, cat=0, timeframe='today 3-m', geo='DE')
-            data = pytrends.interest_over_time()
-            if not data.empty:
-                means = data.mean()
-                for kw in batch:
-                    if kw in means: trend_map[kw] = int(means[kw])
-            time.sleep(1.0)
+        pytrends.build_payload(candidates[:5], cat=0, timeframe='today 3-m', geo='DE')
+        data = pytrends.interest_over_time()
+        if not data.empty:
+            means = data.mean()
+            for kw in candidates[:5]:
+                if kw in means: trend_map[kw] = int(means[kw])
     except: pass
     return trend_map
 
@@ -238,7 +245,7 @@ with st.sidebar:
     <b>Pipeline:</b>
     <br>1. <b>Translation:</b> Finds cultural equivalents.
     <br>2. <b>Mining:</b> Scrapes Google Autocomplete.
-    <br>3. <b>Clustering:</b> Uses Vector Embeddings to group keywords into "Content Clusters".
+    <br>3. <b>Clustering:</b> Uses Vectors to group keywords.
     <br>4. <b>Briefing:</b> Generates AI content outlines.
     </div>
     """, unsafe_allow_html=True)
@@ -256,7 +263,7 @@ if run_btn and keyword and api_key:
         strategy = get_cultural_translation(api_key, keyword)
     
     if not strategy or "error" in strategy:
-        st.error("AI Error. Check API Key.")
+        st.error(f"AI Error: {strategy.get('error') if strategy else 'Unknown'}")
         st.stop()
 
     synonyms = strategy.get('synonyms', [])
@@ -276,19 +283,23 @@ if run_btn and keyword and api_key:
             
             df_clean = df[df['Keep'] == True].copy()
             
-            # 4. CLUSTERING (The Perfect Feature)
+            if df_clean.empty:
+                st.warning("AI filtered out all keywords (Brand/Irrelevant). Showing raw list.")
+                df_clean = df
+            
+            # 4. CLUSTERING
             df_clustered = cluster_keywords(df_clean)
             
-            # 5. Trends
+            # 5. Trends (Quietly in background)
             trends = fetch_smart_trends(df_clustered)
-            df_clustered['Trend'] = df_clustered['German Keyword'].map(trends).fillna("N/A")
+            df_clustered['Trend'] = df_clustered['German Keyword'].map(trends).fillna("-")
 
         # --- OUTPUT TABS ---
         tab_clusters, tab_data = st.tabs(["🧠 Topic Clusters", "📊 Raw Data"])
         
         with tab_clusters:
             st.markdown("### Content Architecture")
-            st.markdown("We grouped the keywords into semantic clusters. Each cluster represents **One Article** you should write.")
+            st.markdown("We grouped the keywords into semantic clusters. Each cluster represents **One Article**.")
             
             clusters = df_clustered['Cluster Name'].unique()
             
@@ -302,16 +313,17 @@ if run_btn and keyword and api_key:
                         st.dataframe(c_data[['German Keyword', 'English', 'Trend']], use_container_width=True, hide_index=True)
                     
                     with c2:
-                        if st.button(f"✨ Draft Brief for '{c_name}'", key=c_name):
-                            with st.spinner("Generating Content Brief..."):
-                                brief = generate_content_brief(api_key, c_name, keywords_list[:10])
+                        if st.button(f"✨ Create Brief", key=c_name):
+                            with st.spinner("Drafting..."):
+                                brief = generate_content_brief(api_key, c_name, keywords_list[:8])
                                 if brief and "error" not in brief:
-                                    st.success("Brief Generated!")
+                                    st.success("Brief Ready!")
                                     st.markdown(f"**H1 (DE):** {brief.get('h1_german')}")
                                     st.markdown(f"**H1 (EN):** {brief.get('h1_english')}")
-                                    st.markdown("**Outline:**")
                                     for sec in brief.get('outline', []):
-                                        st.markdown(f"- **{sec.get('h2')}** ({sec.get('intent')})")
+                                        st.markdown(f"- **{sec.get('h2')}**")
+                                else:
+                                    st.error("Brief generation failed.")
         
         with tab_data:
             st.dataframe(df_clustered, use_container_width=True)
