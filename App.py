@@ -7,7 +7,7 @@ import google.generativeai as genai
 from pytrends.request import TrendReq
 import plotly.express as px
 import re
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
 from sklearn.cluster import AgglomerativeClustering
 import numpy as np
 
@@ -31,18 +31,41 @@ st.markdown("""
     #MainMenu {visibility: hidden;} footer {visibility: hidden;}
     
     /* Cluster Styling */
-    .cluster-box {
-        border: 1px solid #e1e4e8; background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 10px;
-    }
+    .cluster-box { border: 1px solid #e1e4e8; background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. VECTOR ENGINE (Clustering)
+# 2. VECTOR ENGINE (Clustering & Filtering)
 # -----------------------------------------------------------------------------
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_embedding_model():
+    # Multilingual model is best for German/English comparison
     return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+
+def filter_by_semantic_relevance(df_keywords, seed_english, threshold):
+    """
+    Calculates similarity between the English Seed and German Keywords.
+    Drops rows below the threshold.
+    """
+    model = load_embedding_model()
+    
+    # 1. Encode Seed (English)
+    seed_vec = model.encode(seed_english)
+    
+    # 2. Encode Candidates (German)
+    candidate_vecs = model.encode(df_keywords['German Keyword'].tolist())
+    
+    # 3. Calculate Cosine Similarity
+    scores = util.cos_sim(seed_vec, candidate_vecs)[0]
+    
+    # 4. Assign & Filter
+    df_keywords['Relevance Score'] = scores.numpy()
+    
+    # Keep only high relevance
+    df_filtered = df_keywords[df_keywords['Relevance Score'] >= threshold].copy()
+    
+    return df_filtered.sort_values('Relevance Score', ascending=False)
 
 def cluster_keywords(df_keywords):
     if len(df_keywords) < 3:
@@ -50,11 +73,8 @@ def cluster_keywords(df_keywords):
         return df_keywords
 
     model = load_embedding_model()
-    
-    # Vectorize
     embeddings = model.encode(df_keywords['German Keyword'].tolist())
     
-    # Cluster
     clustering = AgglomerativeClustering(
         n_clusters=None, 
         distance_threshold=1.5, 
@@ -64,11 +84,9 @@ def cluster_keywords(df_keywords):
     cluster_ids = clustering.fit_predict(embeddings)
     df_keywords['Cluster ID'] = cluster_ids
     
-    # Name Clusters
     cluster_names = {}
     for cid in np.unique(cluster_ids):
         subset = df_keywords[df_keywords['Cluster ID'] == cid]
-        # Head term is usually the shortest
         head_term = sorted(subset['German Keyword'].tolist(), key=len)[0]
         cluster_names[cid] = head_term.title()
         
@@ -76,94 +94,54 @@ def cluster_keywords(df_keywords):
     return df_keywords.sort_values('Cluster ID')
 
 # -----------------------------------------------------------------------------
-# 3. GENERATIVE ENGINE (Dynamic Discovery)
+# 3. GENERATIVE ENGINE
 # -----------------------------------------------------------------------------
 
-def get_best_model_name(api_key):
-    """
-    Dynamically asks Google which models are available to this Key
-    and picks the best one.
-    """
-    genai.configure(api_key=api_key)
-    try:
-        # 1. List all models
-        all_models = list(genai.list_models())
-        
-        # 2. Filter for text generation support
-        valid_models = [m for m in all_models if 'generateContent' in m.supported_generation_methods]
-        
-        if not valid_models:
-            return "models/gemini-1.5-flash" # Fallback
-            
-        # 3. Selection Strategy
-        # Priority: Flash (Fast) > Pro (Smart) > Any
-        for m in valid_models:
-            if 'flash' in m.name.lower() and '1.5' in m.name: return m.name
-            
-        for m in valid_models:
-            if 'pro' in m.name.lower() and '1.5' in m.name: return m.name
-            
-        # Fallback to first valid model found
-        return valid_models[0].name
-        
-    except Exception as e:
-        # If listing fails, guess the most standard one
-        return "models/gemini-1.5-flash"
-
 def run_gemini(api_key, prompt):
-    try:
-        # Dynamically find model
-        model_name = get_best_model_name(api_key)
-        model = genai.GenerativeModel(model_name)
-        
-        response = model.generate_content(prompt)
-        
-        # Clean Markdown
-        text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
-        
-    except Exception as e:
-        return {"error": str(e)}
+    genai.configure(api_key=api_key)
+    candidates = ["gemini-1.5-flash", "gemini-1.5-flash-latest", "gemini-1.5-pro", "gemini-pro"]
+    for model_name in candidates:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            text = response.text.replace("```json", "").replace("```", "").strip()
+            return json.loads(text)
+        except Exception as e:
+            if "429" in str(e): time.sleep(1)
+            continue
+    return {"error": "All models failed."}
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
     Act as a Native German SEO Expert.
     English Keyword: "{keyword}"
-    
     Task: Identify the top 3 distinct German terms used for this concept.
     1. Colloquial (Most common).
     2. Formal/Medical.
     3. Synonym.
-    
     Return JSON: {{ "synonyms": ["term1", "term2", "term3"], "explanation": "Reasoning" }}
     """
     return run_gemini(api_key, prompt)
 
 def batch_validate_translate(api_key, keywords, topic):
     if not keywords: return {}
-    
     full_map = {}
     chunks = [keywords[i:i + 30] for i in range(0, len(keywords), 30)]
     
     prog_text = st.empty()
-    
     for i, chunk in enumerate(chunks):
         prog_text.caption(f"AI analyzing batch {i+1}/{len(chunks)}...")
         prompt = f"""
         Context Topic: "{topic}"
         Keywords: {json.dumps(chunk)}
-        
-        Task:
+        Task: 
         1. Translate to English.
         2. "keep": false if it is a Brand Name, Store, or completely Off-Topic.
-        
         Return JSON: {{ "german_word": {{ "en": "english", "keep": true }} }}
         """
         res = run_gemini(api_key, prompt)
-        if "error" not in res:
-            full_map.update(res)
-        time.sleep(0.5)
-        
+        if "error" not in res: full_map.update(res)
+        time.sleep(0.2)
     prog_text.empty()
     return full_map
 
@@ -172,15 +150,12 @@ def generate_content_brief(api_key, cluster_name, keywords):
     Act as a Content Strategist.
     Target Topic: "{cluster_name}"
     Keywords: {", ".join(keywords)}
-    
     Create a brief for a German article.
     Return JSON:
     {{
         "h1_german": "Optimized H1",
         "h1_english": "Translation",
-        "outline": [
-            {{ "h2": "German H2", "intent": "Content notes" }}
-        ]
+        "outline": [ {{ "h2": "German H2", "intent": "Content notes" }} ]
     }}
     """
     return run_gemini(api_key, prompt)
@@ -210,7 +185,6 @@ def deep_mine(synonyms):
             prog.progress(min(step/total, 1.0), f"Mining: {seed}{mod}...")
             
             results = fetch_suggestions(f"{seed}{mod}")
-            
             intent = "Informational"
             if "kaufen" in mod: intent = "Transactional"
             elif "gegen" in mod: intent = "Solution"
@@ -231,10 +205,8 @@ def deep_mine(synonyms):
     return df
 
 def fetch_smart_trends(df_keywords):
-    # Top 10 Shortest (Head Terms)
     candidates = df_keywords.sort_values('Length').head(10)['German Keyword'].tolist()
     trend_map = {}
-    
     try:
         pytrends = TrendReq(hl='de-DE', tz=360)
         pytrends.build_payload(candidates[:5], cat=0, timeframe='today 3-m', geo='DE')
@@ -255,13 +227,14 @@ with st.sidebar:
     st.markdown("""<a href="https://aistudio.google.com/app/apikey" target="_blank" style="font-size:0.8rem;color:#0969da;">🔑 Get Free Key</a>""", unsafe_allow_html=True)
     
     st.markdown("---")
-    st.markdown("""
+    
+    # SEMANTIC FILTER SLIDER
+    relevance_threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.55, 0.05)
+    st.markdown(f"""
     <div class="tech-note">
-    <b>Pipeline:</b>
-    <br>1. <b>Translation:</b> Finds cultural equivalents.
-    <br>2. <b>Mining:</b> Scrapes Google Autocomplete.
-    <br>3. <b>Clustering:</b> Uses Vectors to group keywords.
-    <br>4. <b>Briefing:</b> Generates AI content outlines.
+    <b>Semantic Filter ({relevance_threshold}):</b>
+    <br>We calculate the vector distance between your Input Topic and every mined keyword.
+    <br>• Keywords scoring below <b>{relevance_threshold}</b> are automatically discarded as "Topic Drift".
     </div>
     """, unsafe_allow_html=True)
 
@@ -273,6 +246,10 @@ run_btn = st.button("Generate Strategy", type="primary")
 
 if run_btn and keyword and api_key:
     
+    with st.spinner("Initializing Vector Engine..."):
+        try: _ = load_embedding_model()
+        except: st.stop()
+
     # 1. Strategy
     with st.spinner("Analyzing German Linguistics..."):
         strategy = get_cultural_translation(api_key, keyword)
@@ -290,22 +267,35 @@ if run_btn and keyword and api_key:
     if not df.empty:
         # 3. Filter & Translate
         with st.spinner("Validating & Clustering Keywords..."):
-            raw_list = df['German Keyword'].tolist()
+            
+            # --- NEW STEP: SEMANTIC VECTOR FILTERING ---
+            df_filtered = filter_by_semantic_relevance(df, keyword, relevance_threshold)
+            dropped_count = len(df) - len(df_filtered)
+            
+            if df_filtered.empty:
+                st.error(f"All {len(df)} keywords were below the relevance threshold ({relevance_threshold}). Try lowering the slider.")
+                st.stop()
+            
+            if dropped_count > 0:
+                st.success(f"Filtered out {dropped_count} irrelevant keywords (Score < {relevance_threshold}). Remaining: {len(df_filtered)}")
+
+            # Continue with filtered list
+            raw_list = df_filtered['German Keyword'].tolist()
             valid_map = batch_validate_translate(api_key, raw_list, keyword)
             
-            df['English'] = df['German Keyword'].apply(lambda x: valid_map.get(x, {}).get('en', '-'))
-            df['Keep'] = df['German Keyword'].apply(lambda x: valid_map.get(x, {}).get('keep', True))
+            df_filtered['English'] = df_filtered['German Keyword'].apply(lambda x: valid_map.get(x, {}).get('en', '-'))
+            df_filtered['Keep'] = df_filtered['German Keyword'].apply(lambda x: valid_map.get(x, {}).get('keep', True))
             
-            df_clean = df[df['Keep'] == True].copy()
+            df_clean = df_filtered[df_filtered['Keep'] == True].copy()
             
             if df_clean.empty:
-                st.warning("AI filtered out all keywords (Brand/Irrelevant). Showing raw list.")
-                df_clean = df
+                st.warning("AI filtered out all keywords (Brand/Irrelevant).")
+                df_clean = df_filtered
             
             # 4. CLUSTERING
             df_clustered = cluster_keywords(df_clean)
             
-            # 5. Trends (Quietly in background)
+            # 5. Trends
             trends = fetch_smart_trends(df_clustered)
             df_clustered['Trend'] = df_clustered['German Keyword'].map(trends).fillna("-")
 
@@ -325,7 +315,7 @@ if run_btn and keyword and api_key:
                 with st.expander(f"📁 Cluster: {c_name} ({len(c_data)} keywords)"):
                     c1, c2 = st.columns([2, 1])
                     with c1:
-                        st.dataframe(c_data[['German Keyword', 'English', 'Trend']], use_container_width=True, hide_index=True)
+                        st.dataframe(c_data[['German Keyword', 'English', 'Relevance Score']], use_container_width=True, hide_index=True)
                     
                     with c2:
                         if st.button(f"✨ Create Brief", key=c_name):
