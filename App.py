@@ -173,23 +173,68 @@ def fetch_suggestions(query):
     return []
 
 def deep_mine(synonyms):
-    modifiers = ["", " für", " bei", " gegen", " was", " wann", " hausmittel", " kaufen"]
+    # Expanded Modifier List covering the full SEO Funnel
+    modifiers = [
+        # 1. General / Head Terms
+        "",  
+        
+        # 2. Informational (Problem/Context)
+        " was", " ist", # Definition
+        " wann", " wie", # Timing/Method
+        " ursache", " symptome", # Medical/Technical context
+        
+        # 3. Use Case / Solution
+        " für", " bei", # Context
+        " gegen", " hausmittel", # Remedies
+        " anleitung", " tipps", # How-to
+        
+        # 4. Commercial Investigation (Best/Compare)
+        " test", " testsieger", # Reviews
+        " beste", " top", # Best of
+        " vs", " oder", # Comparisons
+        " erfahrungen", " bewertung", # Social Proof
+        
+        # 5. Transactional (Buy/Cost)
+        " kaufen", " bestellen", # Action
+        " kosten", " preis", # Pricing
+        " günstig" # Discount/Cheap
+    ]
+    
     all_data = []
-    prog = st.progress(0, "Mining...")
+    
+    prog = st.progress(0, "Mining Google Germany...")
     total = len(synonyms) * len(modifiers)
     step = 0
+    
     for seed in synonyms:
         for mod in modifiers:
-            step += 1; prog.progress(min(step/total, 1.0), f"Mining: {seed}{mod}...")
+            step += 1
+            prog.progress(min(step/total, 1.0), f"Mining: {seed}{mod}...")
+            
             results = fetch_suggestions(f"{seed}{mod}")
+            
+            # Auto-Tagging Intent based on modifier
+            intent = "General"
+            if mod.strip() in ["was", "ist", "wann", "wie", "ursache", "symptome"]: intent = "Informational"
+            elif mod.strip() in ["anleitung", "tipps", "hausmittel", "gegen"]: intent = "How-to / Solution"
+            elif mod.strip() in ["test", "testsieger", "beste", "top", "vs", "oder", "erfahrungen", "bewertung"]: intent = "Commercial Investigation"
+            elif mod.strip() in ["kaufen", "bestellen", "kosten", "preis", "günstig"]: intent = "Transactional"
+            
             for r in results:
-                all_data.append({"German Keyword": r, "Seed": seed})
-            time.sleep(0.05)
+                all_data.append({
+                    "German Keyword": r, 
+                    "Seed": seed,
+                    "Intent": intent,
+                    "Length": len(r)
+                })
+            time.sleep(0.05) # Rate limit safety
+            
     prog.empty()
     df = pd.DataFrame(all_data)
-    if not df.empty: return df.drop_duplicates(subset=['German Keyword'])
+    if not df.empty:
+        return df.drop_duplicates(subset=['German Keyword'])
     return df
-
+    
 def fetch_smart_trends(df_keywords):
     candidates = df_keywords.sort_values(by="German Keyword", key=lambda x: x.str.len()).head(10)['German Keyword'].tolist()
     trend_map = {}
@@ -338,3 +383,4 @@ if st.session_state.data_processed:
 
 elif not st.session_state.data_processed and run_btn:
     st.error("Please provide API Keys.")
+
