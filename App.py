@@ -17,56 +17,77 @@ st.markdown("""
 <style>
     :root { --primary-color: #1a7f37; --background-color: #ffffff; --secondary-background-color: #f6f8fa; --text-color: #24292e; }
     .stApp { background-color: #ffffff; color: #24292e; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    
     h1, h2, h3 { color: #111; font-weight: 600; letter-spacing: -0.5px; }
-    .metric-card { background: #ffffff; border: 1px solid #e1e4e8; border-radius: 8px; padding: 20px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.02); margin-bottom: 10px; }
+    
+    .metric-card {
+        background: #ffffff; border: 1px solid #e1e4e8; border-radius: 8px; padding: 20px; text-align: center;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.02); margin-bottom: 10px;
+    }
     .metric-val { font-size: 1.5rem; font-weight: 700; color: #1a7f37; margin-bottom: 5px; }
     .metric-lbl { font-size: 0.8rem; color: #586069; text-transform: uppercase; letter-spacing: 0.5px; }
+    
     section[data-testid="stSidebar"] { background-color: #f6f8fa; border-right: 1px solid #d0d7de; }
     .stTextInput input { background-color: #ffffff !important; border: 1px solid #d0d7de !important; color: #24292e !important; }
+    
     #MainMenu {visibility: hidden;} footer {visibility: hidden;}
     [data-testid="stDataFrame"] { border: 1px solid #e1e4e8; }
+    
+    .tech-note { font-size: 0.85rem; color: #57606a; background-color: #f6f8fa; border-left: 3px solid #0969da; padding: 12px; border-radius: 0 4px 4px 0; }
 </style>
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. LOGIC ENGINE (Robust AI)
+# 2. LOGIC ENGINE (Dynamic Discovery)
 # -----------------------------------------------------------------------------
 
-def run_gemini_prompt(api_key, prompt):
+def get_active_model_name(api_key):
     """
-    Tries multiple model versions until one works.
+    Connects to Google, lists available models, and picks the best text generator.
     """
     genai.configure(api_key=api_key)
-    
-    # Priority list: Flash is fastest/free-est
-    candidates = [
-        "gemini-1.5-flash", 
-        "gemini-1.5-flash-latest", 
-        "gemini-1.5-pro", 
-        "gemini-1.5-pro-latest",
-        "gemini-1.0-pro"
-    ]
-    
-    last_error = None
-    
-    for model_name in candidates:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
+    try:
+        # Get all models available to this key
+        all_models = list(genai.list_models())
+        
+        # Filter for models that can generate content
+        text_models = [m for m in all_models if 'generateContent' in m.supported_generation_methods]
+        
+        if not text_models:
+            return "gemini-1.5-flash" # Desperate fallback
             
-            # If successful, clean and return text
-            text = response.text
-            if "```" in text:
-                text = re.sub(r"```json|```", "", text).strip()
-            return json.loads(text)
+        # Priority 1: Flash (Fastest/Cheapest)
+        for m in text_models:
+            if 'flash' in m.name.lower(): return m.name
             
-        except Exception as e:
-            last_error = e
-            time.sleep(1) # Brief pause before retry
-            continue
+        # Priority 2: Pro
+        for m in text_models:
+            if 'pro' in m.name.lower(): return m.name
             
-    # If all fail
-    raise Exception(f"All models failed. Last error: {str(last_error)}")
+        # Priority 3: First available
+        return text_models[0].name
+        
+    except Exception as e:
+        # If listing fails, guess the most common one
+        return "gemini-1.5-flash"
+
+def run_gemini_prompt(api_key, prompt):
+    model_name = get_active_model_name(api_key)
+    
+    try:
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(prompt)
+        
+        # Clean output
+        text = response.text
+        if "```" in text:
+            text = re.sub(r"```json|```", "", text).strip()
+            
+        return json.loads(text)
+        
+    except Exception as e:
+        # Raise specific error for debugging
+        raise Exception(f"Model ({model_name}) failed: {str(e)}")
 
 def get_synonyms_strategy(api_key, keyword):
     prompt = f"""
@@ -94,8 +115,8 @@ def batch_translate_full(api_key, all_keywords):
     if not all_keywords: return {}
     
     full_map = {}
-    # Chunk size 40 to be safe
-    chunks = [all_keywords[i:i + 40] for i in range(0, len(all_keywords), 40)]
+    # Chunk size 50
+    chunks = [all_keywords[i:i + 50] for i in range(0, len(all_keywords), 50)]
     
     prog_text = st.empty()
     
@@ -109,7 +130,8 @@ def batch_translate_full(api_key, all_keywords):
         """
         try:
             res = run_gemini_prompt(api_key, prompt)
-            full_map.update(res)
+            if res: full_map.update(res)
+            time.sleep(0.2)
         except:
             continue
         
@@ -271,9 +293,11 @@ if run_btn and keyword and api_key:
             sel_intent = st.selectbox("Filter by Intent:", all_intents)
             
             df_display = df_keywords if sel_intent == "All" else df_keywords[df_keywords['Intent'] == sel_intent]
+            
+            # Sort by Wiki Views descending
             df_display = df_display.sort_values('Monthly Wiki Views', ascending=False)
             
-            # Columns
+            # Reorder
             df_display = df_display[['German Keyword', 'English Meaning', 'Monthly Wiki Views', 'Wiki Topic', 'Intent', 'Seed Term']]
 
             st.dataframe(
@@ -284,8 +308,13 @@ if run_btn and keyword and api_key:
                     "German Keyword": st.column_config.TextColumn("🇩🇪 German Query", width="medium"),
                     "English Meaning": st.column_config.TextColumn("🇺🇸 English Meaning", width="medium"),
                     "Monthly Wiki Views": st.column_config.ProgressColumn(
-                        "Wiki Interest", format="%d", min_value=0, max_value=int(df_display['Monthly Wiki Views'].max())
-                    )
+                        "Wiki Interest", 
+                        help="Pageviews for the associated Wikipedia article (Last 30 Days). High views = High informational demand.",
+                        format="%d", 
+                        min_value=0, 
+                        max_value=int(df_display['Monthly Wiki Views'].max())
+                    ),
+                    "Mapped Entity": st.column_config.TextColumn("Wiki Topic", width="small"),
                 }
             )
             
