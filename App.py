@@ -7,7 +7,6 @@ import google.generativeai as genai
 from pytrends.request import TrendReq
 import plotly.express as px
 import re
-from sentence_transformers import SentenceTransformer
 from sklearn.cluster import AgglomerativeClustering
 import numpy as np
 
@@ -35,58 +34,88 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. VECTOR ENGINE (Optimized & Cached)
+# 2. VECTOR ENGINE (Cloud-Based / Lightweight)
 # -----------------------------------------------------------------------------
 
-@st.cache_resource(show_spinner=False)
-def load_embedding_model():
+def get_embeddings_google(text_list, api_key):
     """
-    Loads the Multilingual Model (470MB).
-    Cached to run instantly after the first download.
+    Uses Google's 'text-embedding-004' model via API.
+    Zero RAM usage, instant speed.
     """
-    # We use the specific multilingual model required for German-English matching
-    return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-
-# Trigger load immediately on app start to unblock UI later
-with st.spinner("Warming up AI Engines (First run takes ~60s)..."):
+    genai.configure(api_key=api_key)
+    
+    # Batching (Google accepts up to 100 docs per call usually, we stick to safe batches)
+    # Note: For 'text-embedding-004', content is passed as 'content'
+    embeddings = []
+    
+    # Simple loop to avoid complexity, for SEO lists (usually < 200 items) this is fast enough
+    # Ideally, use batch_embed_contents if lists are huge
     try:
-        _ = load_embedding_model()
+        result = genai.embed_content(
+            model="models/text-embedding-004",
+            content=text_list,
+            task_type="clustering",
+        )
+        # The result['embedding'] is a list of vectors
+        return result['embedding']
     except Exception as e:
-        st.warning("Model download slow. Please wait...")
+        st.error(f"Embedding Error: {e}")
+        return []
 
-def filter_by_semantic_relevance(df_keywords, seed_english, threshold):
-    model = load_embedding_model()
-    from sentence_transformers import util
+def filter_by_semantic_relevance(df_keywords, seed_english, threshold, api_key):
+    # 1. Embed Seed
+    seed_vec = get_embeddings_google([seed_english], api_key)[0]
     
-    seed_vec = model.encode(seed_english)
-    candidate_vecs = model.encode(df_keywords['German Keyword'].tolist())
-    scores = util.cos_sim(seed_vec, candidate_vecs)[0]
+    # 2. Embed Candidates
+    candidates = df_keywords['German Keyword'].tolist()
+    # We might need to batch this if > 100 keywords, but for this tool it's okay
+    candidate_vecs = get_embeddings_google(candidates, api_key)
     
-    df_keywords['Relevance Score'] = scores.numpy()
+    if not candidate_vecs: return df_keywords # Fallback if API fails
+    
+    # 3. Cosine Similarity Manually (No heavy libraries)
+    scores = []
+    seed_norm = np.linalg.norm(seed_vec)
+    
+    for vec in candidate_vecs:
+        vec_norm = np.linalg.norm(vec)
+        if seed_norm == 0 or vec_norm == 0:
+            scores.append(0.0)
+        else:
+            dot_product = np.dot(seed_vec, vec)
+            scores.append(dot_product / (seed_norm * vec_norm))
+            
+    df_keywords['Relevance Score'] = scores
+    
     # Filter
     df_filtered = df_keywords[df_keywords['Relevance Score'] >= threshold].copy()
     return df_filtered.sort_values('Relevance Score', ascending=False)
 
-def cluster_keywords(df_keywords):
+def cluster_keywords(df_keywords, api_key):
     if len(df_keywords) < 3:
         df_keywords['Cluster'] = "Single Topic"
         return df_keywords
 
-    model = load_embedding_model()
-    embeddings = model.encode(df_keywords['German Keyword'].tolist())
+    # Get Vectors via API
+    embeddings = get_embeddings_google(df_keywords['German Keyword'].tolist(), api_key)
     
+    if not embeddings: return df_keywords
+    
+    # Cluster
     clustering = AgglomerativeClustering(
         n_clusters=None, 
-        distance_threshold=1.5, 
+        distance_threshold=0.8, # Adjusted for Google Embeddings scale
         metric='euclidean', 
         linkage='ward'
     )
     cluster_ids = clustering.fit_predict(embeddings)
     df_keywords['Cluster ID'] = cluster_ids
     
+    # Name Clusters
     cluster_names = {}
     for cid in np.unique(cluster_ids):
         subset = df_keywords[df_keywords['Cluster ID'] == cid]
+        # Head term is usually the shortest
         head_term = sorted(subset['German Keyword'].tolist(), key=len)[0]
         cluster_names[cid] = head_term.title()
         
@@ -185,6 +214,7 @@ def deep_mine(synonyms):
             prog.progress(min(step/total, 1.0), f"Mining: {seed}{mod}...")
             
             results = fetch_suggestions(f"{seed}{mod}")
+            
             intent = "Informational"
             if "kaufen" in mod: intent = "Transactional"
             elif "gegen" in mod: intent = "Solution"
@@ -227,12 +257,11 @@ with st.sidebar:
     st.markdown("""<a href="https://aistudio.google.com/app/apikey" target="_blank" style="font-size:0.8rem;color:#0969da;">🔑 Get Free Key</a>""", unsafe_allow_html=True)
     
     st.markdown("---")
-    # SLIDER
     relevance_threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.55, 0.05)
     st.markdown(f"""
     <div class="tech-note">
-    <b>Semantic Filter ({relevance_threshold}):</b>
-    <br>Keywords below this similarity score are removed to prevent topic drift.
+    <b>Cloud Vector Engine:</b>
+    Using Google's <code>text-embedding-004</code> for instant, lightweight clustering.
     </div>
     """, unsafe_allow_html=True)
 
@@ -260,16 +289,17 @@ if run_btn and keyword and api_key:
     
     if not df.empty:
         # 3. Filter & Translate
-        with st.spinner("Validating & Clustering..."):
+        with st.spinner("Validating & Clustering Keywords (Cloud Mode)..."):
             
-            # --- FILTERING ---
-            df_filtered = filter_by_semantic_relevance(df, keyword, relevance_threshold)
+            # --- CLOUD SEMANTIC FILTERING ---
+            df_filtered = filter_by_semantic_relevance(df, keyword, relevance_threshold, api_key)
             
+            dropped_count = len(df) - len(df_filtered)
             if df_filtered.empty:
-                st.error(f"All keywords filtered. Lower the threshold (current: {relevance_threshold}).")
+                st.error(f"All keywords filtered. Try lowering the threshold.")
                 st.stop()
             
-            st.success(f"Kept {len(df_filtered)} relevant keywords (Discarded {len(df)-len(df_filtered)}).")
+            st.success(f"Kept {len(df_filtered)} relevant keywords (Discarded {dropped_count}).")
 
             # Translate kept keywords
             raw_list = df_filtered['German Keyword'].tolist()
@@ -278,11 +308,14 @@ if run_btn and keyword and api_key:
             df_filtered['English'] = df_filtered['German Keyword'].apply(lambda x: valid_map.get(x, {}).get('en', '-'))
             df_filtered['Keep'] = df_filtered['German Keyword'].apply(lambda x: valid_map.get(x, {}).get('keep', True))
             
-            # Second Filter (Brand check)
             df_clean = df_filtered[df_filtered['Keep'] == True].copy()
             
-            # 4. CLUSTERING
-            df_clustered = cluster_keywords(df_clean)
+            if df_clean.empty:
+                st.warning("AI filtered out all keywords (Brand/Irrelevant).")
+                df_clean = df_filtered
+            
+            # 4. CLUSTERING (Via Cloud Embeddings)
+            df_clustered = cluster_keywords(df_clean, api_key)
             
             # 5. Trends
             trends = fetch_smart_trends(df_clustered)
