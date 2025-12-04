@@ -15,7 +15,7 @@ import torch
 # -----------------------------------------------------------------------------
 # 1. VISUAL CONFIGURATION (Strict Dejan Style)
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="German SEO Strategist", layout="wide", page_icon="🇩🇪")
+st.set_page_config(page_title="German Vector Strategist", layout="wide", page_icon="🇩🇪")
 
 st.markdown("""
 <style>
@@ -32,7 +32,7 @@ st.markdown("""
     #MainMenu {visibility: hidden;} footer {visibility: hidden;}
     
     .cluster-box { border: 1px solid #e1e4e8; background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 10px; }
-    .tech-note { font-size: 0.85rem; color: #57606a; background-color: #f6f8fa; border-left: 3px solid #0969da; padding: 12px; border-radius: 0 4px 4px 0; margin-bottom: 15px; }
+    .tech-note { font-size: 0.85rem; color: #57606a; background-color: #f6f8fa; border-left: 3px solid #0969da; padding: 12px; border-radius: 0 4px 4px 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -60,6 +60,11 @@ def load_gemma_model(hf_token):
         return None
 
 def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
+    """
+    1. Filters keywords.
+    2. Separates "Direct Variations" (>0.85 score) from "Broad Clusters".
+    3. Clusters the broad list.
+    """
     model = load_gemma_model(hf_token)
     if not model: return None, None
     
@@ -76,12 +81,12 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     # Filter noise
     df_relevant = df_keywords[df_keywords['Relevance'] >= threshold].copy()
     
-    # --- B. SPLITTING ---
-    # Direct Variations (>0.82) vs Clusters
+    # --- B. SPLITTING (Direct vs Broad) ---
+    # Direct Variations: Extremely high similarity (>0.82) OR contains exact seed word
     df_direct = df_relevant[df_relevant['Relevance'] > 0.82].copy()
     df_clusters = df_relevant[df_relevant['Relevance'] <= 0.82].copy()
     
-    # --- C. CLUSTERING ---
+    # --- C. CLUSTERING (Only the broad ones) ---
     if len(df_clusters) > 2:
         cluster_vecs = model.encode(df_clusters['German Keyword'].tolist(), prompt_name="Clustering", normalize_embeddings=True)
         clustering = AgglomerativeClustering(n_clusters=None, distance_threshold=0.85, metric='euclidean', linkage='ward')
@@ -97,6 +102,7 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
         df_clusters['Cluster Name'] = df_clusters['Cluster ID'].map(cluster_names)
     else:
         df_clusters['Cluster Name'] = "General"
+        # Handle empty case if everything went to Direct
         if 'Cluster ID' not in df_clusters.columns: df_clusters['Cluster ID'] = 0
 
     return df_direct.sort_values('Relevance', ascending=False), df_clusters.sort_values('Cluster ID')
@@ -106,9 +112,11 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
 # -----------------------------------------------------------------------------
 def run_gemini(api_key, prompt):
     genai.configure(api_key=api_key)
+    # Dynamic Model Selection
     try:
         models = list(genai.list_models())
         valid = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+        # Priority: Flash -> Pro
         chosen = next((m for m in valid if 'flash' in m), next((m for m in valid if 'pro' in m), "models/gemini-1.5-flash"))
         
         model = genai.GenerativeModel(chosen)
@@ -116,20 +124,17 @@ def run_gemini(api_key, prompt):
         text = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except Exception as e:
-        if "429" in str(e): time.sleep(1); return run_gemini(api_key, prompt)
+        if "429" in str(e): time.sleep(1); return run_gemini(api_key, prompt) # Simple retry
         return {"error": str(e)}
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
-    Act as a Native German SEO Expert.
-    English Keyword: "{keyword}"
-    
-    Task: Identify the 3 most important German search terms for this concept.
-    1. **Colloquial:** What do normal people search for? (e.g. "Wunder Po" vs "Windeldermatitis")
-    2. **Formal:** The medical or technical term.
-    3. **Synonym:** A widely used lateral term.
-    
-    Return JSON: {{ "synonyms": ["term1", "term2", "term3"], "explanation": "Detailed explanation of why these 3 words were chosen and the nuance between them." }}
+    Act as a German Market Specialist. English Input: "{keyword}"
+    Identify 3 distinct German search terms:
+    1. High-Volume Colloquial Term.
+    2. Formal/Technical Term.
+    3. Lateral Synonym/Variation.
+    Return JSON: {{ "synonyms": ["term1", "term2", "term3"], "explanation": "Linguistic context analysis" }}
     """
     return run_gemini(api_key, prompt)
 
@@ -138,10 +143,8 @@ def batch_translate(api_key, keywords):
     chunks = [keywords[i:i+50] for i in range(0, len(keywords), 50)]
     full_map = {}
     for chunk in chunks:
-        prompt = f"""Translate these German search keywords into English. 
-        Keep it literal and concise.
-        Input: {json.dumps(chunk)}. 
-        Return JSON: {{ "German Keyword": "English Translation" }}"""
+        prompt = f"""Translate German to English (Literal): {json.dumps(chunk)}. 
+        Return JSON: {{ "German": "English" }}"""
         res = run_gemini(api_key, prompt)
         if "error" not in res: full_map.update(res)
         time.sleep(0.2)
@@ -149,21 +152,14 @@ def batch_translate(api_key, keywords):
 
 def generate_brief(api_key, cluster_name, keywords):
     prompt = f"""
-    Act as a Senior Content Strategist for the DACH region.
-    Target Topic: "{cluster_name}"
-    Keywords to Cover: {", ".join(keywords)}
-    
-    Task: Create a detailed SEO Content Brief.
-    1. Write an engaging H1 in German.
-    2. Explain the user intent in English.
-    3. Outline the H2 structure.
-    
+    Act as a Technical Content Strategist. Topic: "{cluster_name}". Keywords: {", ".join(keywords)}
+    Create a structured German Content Brief.
     Return JSON:
     {{
-        "h1_german": "German H1",
-        "h1_english": "English Translation",
-        "user_intent": "Analysis of what the user wants",
-        "outline": [ {{ "h2": "German Subheading", "intent": "What to cover in this section" }} ]
+        "h1_german": "Optimized German H1",
+        "h1_english": "Literal English Translation",
+        "user_intent": "Search Intent Analysis",
+        "outline": [ {{ "h2": "German Subheading", "intent": "Technical notes for the writer" }} ]
     }}
     """
     return run_gemini(api_key, prompt)
@@ -180,34 +176,17 @@ def fetch_suggestions(query):
     return []
 
 def deep_mine(synonyms):
-    # Expanded Modifier List for Full Funnel Coverage
-    modifiers = [
-        "",  # Head Term
-        " für", " bei", # Context
-        " gegen", " hausmittel", # Solution
-        " anleitung", " tipps", # How-to
-        " test", " erfahrungen", # Social Proof / Review
-        " kaufen", " kosten", # Transactional
-        " vs", " oder" # Comparison
-    ]
+    modifiers = ["", " für", " bei", " gegen", " was", " wann", " hausmittel", " kaufen"]
     all_data = []
-    prog = st.progress(0, "Initializing Recursive Scraper...")
+    prog = st.progress(0, "Mining Data...")
     total = len(synonyms) * len(modifiers)
     step = 0
     for seed in synonyms:
         for mod in modifiers:
-            step += 1; prog.progress(min(step/total, 1.0), f"Mining Google DE: '{seed}{mod}'...")
+            step += 1; prog.progress(min(step/total, 1.0), f"Mining: {seed}{mod}...")
             results = fetch_suggestions(f"{seed}{mod}")
-            
-            # Auto-Intent Labeling
-            intent = "General"
-            m = mod.strip()
-            if m in ["test", "erfahrungen", "vs", "oder"]: intent = "Commercial Investigation"
-            elif m in ["kaufen", "kosten"]: intent = "Transactional"
-            elif m in ["gegen", "hausmittel", "anleitung"]: intent = "Informational (Solution)"
-            
             for r in results:
-                all_data.append({"German Keyword": r, "Seed": seed, "Intent": intent})
+                all_data.append({"German Keyword": r, "Seed": seed})
             time.sleep(0.05)
     prog.empty()
     df = pd.DataFrame(all_data)
@@ -232,7 +211,7 @@ def fetch_smart_trends(df_keywords):
 # 6. UI & MAIN LOGIC
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### ⚙️ Neural Stack Config")
+    st.markdown("### ⚙️ Engine Architecture")
     api_key = st.text_input("Gemini API Key", type="password")
     hf_token = st.text_input("Hugging Face Token", type="password")
     
@@ -240,42 +219,42 @@ with st.sidebar:
     <a href="https://aistudio.google.com/app/apikey" target="_blank" style="font-size:0.8rem;">🔑 Gemini Key</a> | 
     <a href="https://huggingface.co/settings/tokens" target="_blank" style="font-size:0.8rem;">🤗 HF Token</a>
     """, unsafe_allow_html=True)
-    st.markdown("---")
-    threshold = st.slider("Semantic Precision Threshold", 0.0, 1.0, 0.50, 0.05)
     
-    st.markdown("""
+    st.markdown("---")
+    threshold = st.slider("Semantic Gate (Threshold)", 0.0, 1.0, 0.50, 0.05)
+    st.markdown(f"""
     <div class="tech-note">
-    <b>Methodology: Neuro-Symbolic SEO</b><br>
-    We combine <b>Symbolic AI</b> (Gemini) for reasoning/translation with <b>Connectionist AI</b> (EmbeddingGemma) for mathematical relevance scoring.
-    <br><br>
-    1. <b>Cultural Translation:</b> AI finds the "Native" German terms.
-    2. <b>Recursive Mining:</b> We scrape Google Suggest using German prepositions.
-    3. <b>Vector Filtering:</b> We calculate Cosine Similarity to remove off-topic keywords.
+    <b>Vector Similarity Threshold:</b>
+    <br>Controls the strictness of the vector filter.
+    <br>• <b>High (>0.65):</b> Only accepts keywords that are semantically identical to the input.
+    <br>• <b>Moderate (0.50):</b> Accepts related concepts and lateral topics.
     </div>
     """, unsafe_allow_html=True)
 
 st.title("German Vector Strategist 🇩🇪")
-st.markdown("### Cross-Border Market Intelligence")
+st.markdown("### Cross-Border Market Intelligence System")
 
-with st.expander("📖 How to use this tool", expanded=False):
+with st.expander("Technical Methodology (Neural Retrieval)", expanded=False):
     st.markdown("""
-    **The Challenge:** Standard SEO tools (SEMrush/Ahrefs) often miss "Long-Tail" colloquialisms in German because they rely on database lookups.
+    **1. Linguistic Mapping (Symbolic AI):**
+    Instead of literal translation (which fails on intent), we use Large Language Models (LLMs) to map English concepts to their native German equivalents (e.g., "Mobile Phone" $\\to$ "Handy").
     
-    **The Solution:** This tool performs **Real-Time Intelligence**.
-    1.  Enter an English topic (e.g. "Diaper Rash").
-    2.  The AI identifies that Germans search for "Wunder Po" (Sore Butt), not just the medical term.
-    3.  It mines Google Germany for hundreds of variations.
-    4.  It **Clusters** them by intent and **Writes Briefs** for your writers.
+    **2. Recursive Mining (Data Retrieval):**
+    We execute a recursive scrape of Google Autocomplete using German-specific modifiers (*für, gegen, bei*) to uncover high-intent long-tail queries that standard tools often miss.
+    
+    **3. Vector Filtering (Connectionist AI):**
+    To ensure relevance, we embed all mined keywords into a 768-dimensional vector space using `google/embeddinggemma-300m`. We perform Cosine Similarity analysis against the seed terms to mathematically validate semantic alignment.
     """)
 
 col_in, col_btn = st.columns([3, 1])
 with col_in:
-    keyword = st.text_input("Enter English Topic", placeholder="e.g. first signs of pregnancy", label_visibility="collapsed")
+    keyword = st.text_input("Input Concept (English)", placeholder="e.g. project management software", label_visibility="collapsed")
 with col_btn:
-    run_btn = st.button("Generate Strategy", type="primary", use_container_width=True)
+    run_btn = st.button("Initialize Analysis", type="primary", use_container_width=True)
 
 # --- EXECUTION LOGIC ---
 if run_btn and keyword and api_key and hf_token:
+    # Reset State
     st.session_state.data_processed = False
     st.session_state.briefs = {}
 
@@ -284,7 +263,7 @@ if run_btn and keyword and api_key and hf_token:
         except: st.error("Model Load Failed. Check HF Token."); st.stop()
 
     # 1. Strategy
-    with st.spinner("Consulting German Linguistic Database..."):
+    with st.spinner("Processing Linguistic Context..."):
         strategy = get_cultural_translation(api_key, keyword)
         if not strategy or "error" in strategy: st.error("AI Error."); st.stop()
         st.session_state.synonyms = strategy.get('synonyms', [])
@@ -299,7 +278,7 @@ if run_btn and keyword and api_key and hf_token:
             df_direct, df_clustered = process_keywords_gemma(df, st.session_state.synonyms, threshold, hf_token)
             
         # 4. Translate
-        with st.spinner("Translating Keywords to English..."):
+        with st.spinner("Translating Data Matrix..."):
             all_kws = []
             if not df_direct.empty: all_kws.extend(df_direct['German Keyword'].tolist())
             if not df_clustered.empty: all_kws.extend(df_clustered['German Keyword'].tolist())
@@ -318,41 +297,40 @@ if run_btn and keyword and api_key and hf_token:
         st.session_state.df_clustered = df_clustered
         st.session_state.data_processed = True
     else:
-        st.warning("No keywords found.")
+        st.warning("No data returned from mining layer.")
 
-# --- RENDER RESULTS ---
+# --- RENDER RESULTS FROM STATE ---
 if st.session_state.data_processed:
     
     st.markdown("""
     <div class="tech-note" style="border-left-color: #1a7f37; background: #e6ffed;">
-    <b>🧠 Strategic Context:</b><br>
+    <b>🧠 Linguistic Analysis:</b><br>
     """ + st.session_state.strategy_text + "</div>", unsafe_allow_html=True)
 
     cols = st.columns(len(st.session_state.synonyms))
     for i, syn in enumerate(st.session_state.synonyms):
-        cols[i].markdown(f"""<div class="metric-card"><div class="metric-val">{syn}</div><div class="metric-lbl">Seed Keyword {i+1}</div></div>""", unsafe_allow_html=True)
+        cols[i].markdown(f"""<div class="metric-card"><div class="metric-val">{syn}</div><div class="metric-lbl">Primary Seed {i+1}</div></div>""", unsafe_allow_html=True)
     
     st.write("---")
     
     # SECTION 1: DIRECT
-    st.subheader("1. High-Relevance Variations")
-    st.markdown("These keywords are mathematically identical (Vector Distance > 0.85) to your core topic. Use these for **Metadata & H1s**.")
+    st.subheader("1. High-Fidelity Variations")
+    st.markdown("Keywords with **> 0.85 Vector Similarity**. These represent the same intent as the seed terms and should be treated as direct synonyms.")
     
     if st.session_state.df_direct is not None and not st.session_state.df_direct.empty:
         st.dataframe(
             st.session_state.df_direct[['German Keyword', 'English', 'Relevance']],
-            use_container_width=True, hide_index=True,
-            column_config={
-                "Relevance": st.column_config.ProgressColumn("Semantic Match", format="%.2f", min_value=0, max_value=1, help="Cosine Similarity Score against the German Seed terms.")
-            }
+            use_container_width=True,
+            hide_index=True,
+            column_config={"Relevance": st.column_config.ProgressColumn("Vector Match", format="%.2f", min_value=0, max_value=1)}
         )
     else:
-        st.info("No exact matches found. The topic might be very niche.")
+        st.info("No exact vector matches found. Intent is highly specific.")
 
     # SECTION 2: CLUSTERS
     st.markdown("---")
-    st.subheader("2. Thematic Content Clusters")
-    st.markdown("These groups represent broader sub-topics. Each cluster should be a **Standalone Article** or **FAQ Section**.")
+    st.subheader("2. Semantic Content Clusters")
+    st.markdown("These groups represent distinct **sub-topics**. Each cluster indicates a separate user intent that justifies a unique URL or content section.")
     
     if st.session_state.df_clustered is not None and not st.session_state.df_clustered.empty:
         clusters = st.session_state.df_clustered['Cluster Name'].unique()
@@ -360,42 +338,47 @@ if st.session_state.data_processed:
         for c_name in clusters:
             c_data = st.session_state.df_clustered[st.session_state.df_clustered['Cluster Name'] == c_name]
             keywords_list = c_data['German Keyword'].tolist()
-            eng_title = c_data.iloc[0]['English'] if not c_data.empty else ""
             
-            with st.expander(f"📁 {c_name} ({eng_title}) — {len(c_data)} Keywords"):
+            # Get English Translation of Cluster Name from the first keyword row
+            english_title = c_data.iloc[0]['English'] if not c_data.empty else "Unknown"
+            
+            with st.expander(f"📁 {c_name} ({english_title})"):
                 c1, c2 = st.columns([2, 1])
                 with c1:
+                    # ADDED 'Relevance' HERE
                     st.dataframe(
                         c_data[['German Keyword', 'English', 'Trend', 'Relevance']], 
                         use_container_width=True, 
                         hide_index=True,
                         column_config={
-                            "Relevance": st.column_config.ProgressColumn("Relevance", format="%.2f", min_value=0, max_value=1),
-                            "Trend": st.column_config.TextColumn("🔥 Trend (0-100)")
+                            "Relevance": st.column_config.ProgressColumn("Relevance", format="%.2f", min_value=0, max_value=1)
                         }
                     )
                 with c2:
-                    st.markdown("#### ⚡ Actions")
-                    if st.button(f"Draft Content Brief", key=f"btn_{c_name}"):
-                        with st.spinner("Consulting AI Strategist..."):
+                    # Brief Generation Logic
+                    if st.button(f"✨ Draft Content Brief", key=f"btn_{c_name}"):
+                        with st.spinner("Generating Technical Brief..."):
                             brief = generate_brief(api_key, c_name, keywords_list[:8])
                             st.session_state.briefs[c_name] = brief
                     
+                    # Show stored brief if exists
                     if c_name in st.session_state.briefs:
                         b = st.session_state.briefs[c_name]
                         if "error" not in b:
-                            st.success("Brief Generated!")
+                            st.success("Brief Generated")
                             st.markdown(f"**H1 (DE):** {b.get('h1_german')}")
-                            st.caption(f"English: {b.get('h1_english')}")
-                            st.markdown(f"**User Intent:** {b.get('user_intent')}")
-                            st.markdown("**Suggested Outline:**")
+                            st.caption(f"**H1 (EN):** {b.get('h1_english')}")
+                            st.markdown(f"**Intent:** {b.get('user_intent')}")
+                            st.markdown("**Outline:**")
                             for s in b.get('outline', []):
                                 st.markdown(f"- {s.get('h2')}")
-                        else: st.error("Failed to generate.")
+                        else:
+                            st.error("Generation failed.")
 
+        # Export
         st.markdown("---")
         csv = st.session_state.df_clustered.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Full Strategy CSV", csv, "german_clusters.csv", "text/csv")
+        st.download_button("📥 Export Data Matrix (CSV)", csv, "german_clusters.csv", "text/csv")
 
 elif not st.session_state.data_processed and run_btn:
-    st.error("Please provide API Keys in the sidebar.")
+    st.error("Authentication Error: Please provide valid API Keys in the sidebar.")
