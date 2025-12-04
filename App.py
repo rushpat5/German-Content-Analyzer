@@ -15,6 +15,7 @@ st.set_page_config(page_title="Cross-Border Keyword Bridge", layout="wide", page
 
 st.markdown("""
 <style>
+    /* --- FORCE LIGHT MODE --- */
     :root { --primary-color: #1a7f37; --background-color: #ffffff; --secondary-background-color: #f6f8fa; --text-color: #24292e; }
     .stApp { background-color: #ffffff; color: #24292e; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
     
@@ -30,10 +31,14 @@ st.markdown("""
     
     /* Sidebar */
     section[data-testid="stSidebar"] { background-color: #f6f8fa; border-right: 1px solid #d0d7de; }
+    section[data-testid="stSidebar"] * { color: #24292e !important; }
     .stTextInput input { background-color: #ffffff !important; border: 1px solid #d0d7de !important; color: #24292e !important; }
     
     #MainMenu {visibility: hidden;} footer {visibility: hidden;}
     [data-testid="stDataFrame"] { border: 1px solid #e1e4e8; }
+    
+    /* Tech Note */
+    .tech-note { font-size: 0.85rem; color: #57606a; background-color: #f6f8fa; border-left: 3px solid #0969da; padding: 12px; border-radius: 0 4px 4px 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -41,91 +46,86 @@ st.markdown("""
 # 2. LOGIC ENGINE
 # -----------------------------------------------------------------------------
 
-def get_valid_model(api_key):
+def run_gemini_prompt(api_key, prompt):
     """
-    Robust Model Selector. Prioritizes Flash (Free/Fast).
+    Robustly tries multiple model versions until one succeeds.
     """
     genai.configure(api_key=api_key)
-    try:
-        # Try to list models, but if it fails, just fallback to Flash directly
-        models = list(genai.list_models())
-        valid = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        
-        # Priority 1: Flash 1.5
-        for m in valid:
-            if 'flash' in m and '1.5' in m: return m
-        
-        # Priority 2: Pro 1.5
-        for m in valid:
-            if 'pro' in m and '1.5' in m: return m
+    
+    # List of models to try in order of preference (Fastest -> Smartest -> Legacy)
+    candidates = [
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-pro",
+        "gemini-1.5-pro-latest",
+        "gemini-1.0-pro"
+    ]
+    
+    last_error = None
+    
+    for model_name in candidates:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
             
-        # Priority 3: Legacy Pro
-        return "models/gemini-pro"
-    except:
-        # If listing fails (permissions), blindly return the most likely to work
-        return "models/gemini-1.5-flash"
+            # Clean output
+            text = response.text
+            if "```" in text:
+                text = re.sub(r"```json|```", "", text).strip()
+                
+            return json.loads(text)
+            
+        except Exception as e:
+            last_error = e
+            # If it's a quota error (429), wait briefly then try next model
+            if "429" in str(e):
+                time.sleep(1)
+            continue
+            
+    # If we reach here, all models failed
+    raise Exception(f"All AI models failed. Last error: {str(last_error)}")
 
-def get_synonyms_strategy(api_key, keyword):
+def get_cultural_translation(api_key, keyword):
+    prompt = f"""
+    Act as a Native German SEO Expert.
+    English Keyword: "{keyword}"
+    
+    Task: Identify the top 3 distinct German terms used for this concept. 
+    1. The most common colloquial term (what real people type).
+    2. The formal/medical/technical term (if applicable).
+    3. A popular synonym or related concept.
+    
+    Return ONLY valid JSON. No Markdown.
+    Format:
+    {{
+        "synonyms": ["term1", "term2", "term3"],
+        "explanation": "Brief reason for these choices"
+    }}
+    """
     try:
-        model_name = get_valid_model(api_key)
-        model = genai.GenerativeModel(model_name)
-        
-        prompt = f"""
-        Act as a German Native SEO Expert.
-        English Keyword: "{keyword}"
-        
-        Task: Identify the top 3 distinct German terms used for this concept. 
-        1. The most common colloquial term (what real people type).
-        2. The formal/medical/technical term (if applicable).
-        3. A popular synonym or related concept.
-        
-        Return ONLY valid JSON. No Markdown.
-        Format:
-        {{
-            "synonyms": ["term1", "term2", "term3"],
-            "explanation": "Brief reason for these choices"
-        }}
-        """
-        resp = model.generate_content(prompt)
-        
-        # Cleaning
-        text = resp.text
-        if "```" in text:
-            text = re.sub(r"```json|```", "", text).strip()
-            
-        return json.loads(text)
+        return run_gemini_prompt(api_key, prompt)
     except Exception as e:
-        st.error(f"Strategy Generation Error: {str(e)}")
+        st.error(f"Translation Error: {str(e)}")
         return None
 
 def batch_translate_to_english(api_key, german_keywords):
     if not german_keywords: return {}
     
+    # Chunking to avoid token limits (max 50 at a time)
+    targets = german_keywords[:50] 
+    
+    prompt = f"""
+    Translate these German search queries into English. Keep it short and literal.
+    Input List: {json.dumps(targets)}
+    
+    Return ONLY raw JSON key-value pairs:
+    {{
+        "German Keyword": "English Translation"
+    }}
+    """
     try:
-        model_name = get_valid_model(api_key)
-        model = genai.GenerativeModel(model_name)
-        
-        # Chunking to avoid token limits (max 30 at a time)
-        targets = german_keywords[:50] 
-        
-        prompt = f"""
-        Translate these German search queries into English. Keep it short and literal.
-        Input List: {json.dumps(targets)}
-        
-        Return ONLY raw JSON key-value pairs:
-        {{
-            "German Keyword": "English Translation"
-        }}
-        """
-        resp = model.generate_content(prompt)
-        
-        text = resp.text
-        if "```" in text:
-            text = re.sub(r"```json|```", "", text).strip()
-            
-        return json.loads(text)
+        return run_gemini_prompt(api_key, prompt)
     except Exception as e:
-        st.warning(f"Translation Warning: {str(e)}")
         return {}
 
 def fetch_suggestions(query):
@@ -160,6 +160,7 @@ def deep_mine_synonyms(synonyms):
             elif "hausmittel" in mod: intent = "Informational (DIY)"
             elif "wann" in mod or "was" in mod: intent = "Informational (Q&A)"
             elif "kaufen" in mod or "kosten" in mod: intent = "Transactional"
+            elif "tipps" in mod: intent = "Informational"
             
             for r in results:
                 all_data.append({
@@ -179,15 +180,19 @@ def deep_mine_synonyms(synonyms):
         df = df.drop_duplicates(subset=['German Keyword'])
     return df
 
-def get_trend(keyword):
+def get_google_trends(keywords):
+    """Fetches relative search volume (0-100)."""
     try:
         pytrends = TrendReq(hl='de-DE', tz=360)
-        # Handle potential API errors
-        pytrends.build_payload([keyword], cat=0, timeframe='today 12-m', geo='DE')
-        time.sleep(0.5) 
+        # Only take top 1 for trend graph
+        target = keywords[:1] 
+        pytrends.build_payload(target, cat=0, timeframe='today 12-m', geo='DE', gprop='')
+        time.sleep(0.5)
         data = pytrends.interest_over_time()
-        if not data.empty: return data.drop(columns=['isPartial'])
-    except: return None
+        if not data.empty:
+            return data.drop(columns=['isPartial'])
+    except:
+        return None
     return None
 
 # -----------------------------------------------------------------------------
@@ -196,12 +201,15 @@ def get_trend(keyword):
 with st.sidebar:
     st.markdown("### ⚙️ Engine Config")
     api_key = st.text_input("Gemini API Key", type="password")
+    st.markdown("""<a href="https://aistudio.google.com/app/apikey" target="_blank" style="font-size:0.8rem;color:#0969da;">🔑 Get Free Key</a>""", unsafe_allow_html=True)
     
     st.markdown("---")
     st.markdown("""
     <div class="tech-note">
-    <b>Multi-Seed Mining:</b> 
-    We automatically generate 3 cultural variations of your keyword and recursive-mine Google Autocomplete for all of them.
+    <b>Methodology:</b>
+    <br>1. <b>Synonym Generation:</b> Uses <code>Gemini 1.5 Flash</code> to find Native German variations.
+    <br>2. <b>Multi-Seed Mining:</b> Recursive scraping of Google Autocomplete for all variations.
+    <br>3. <b>Back-Translation:</b> Uses AI to translate findings back to English.
     </div>
     """, unsafe_allow_html=True)
 
@@ -219,7 +227,7 @@ if run_btn and keyword and api_key:
     
     # 1. Identify Synonyms
     with st.spinner("Consulting German Lexicon (AI)..."):
-        strategy = get_synonyms_strategy(api_key, keyword)
+        strategy = get_cultural_translation(api_key, keyword)
     
     if strategy:
         synonyms = strategy.get('synonyms', [])
@@ -240,7 +248,7 @@ if run_btn and keyword and api_key:
         
         # 4. Trends
         main_term = synonyms[0]
-        trend_data = get_trend(main_term)
+        trend_data = get_google_trends([main_term])
 
         # --- OUTPUT ---
         st.markdown("---")
@@ -258,17 +266,19 @@ if run_btn and keyword and api_key:
             
         # Trends
         st.markdown("---")
-        st.subheader("2. Demand Trend")
+        st.subheader(f"2. Demand Trend: '{main_term}'")
         if trend_data is not None:
-            fig = px.line(trend_data, y=main_term, title=f"Interest in '{main_term}' (Germany)", color_discrete_sequence=['#1a7f37'])
+            fig = px.line(trend_data, y=main_term, title="Relative Search Interest (Last 12 Months)",
+                          color_discrete_sequence=['#1a7f37'])
             fig.update_layout(plot_bgcolor='white', yaxis=dict(gridcolor='#f0f0f0'))
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("Trend data unavailable (Google Trends API limits or low volume).")
+            st.warning("Trend data unavailable (Google Trends API limit or low volume).")
 
         # Matrix
         st.markdown("---")
         st.subheader(f"3. The Master Matrix ({len(df_keywords)} Keywords)")
+        st.markdown("Real queries scraped from Google Germany.")
         
         if not df_keywords.empty:
             # Filter
@@ -290,6 +300,7 @@ if run_btn and keyword and api_key:
                 column_config={
                     "German Keyword": st.column_config.TextColumn("🇩🇪 German Query", width="medium"),
                     "English Meaning": st.column_config.TextColumn("🇺🇸 English Meaning", width="medium"),
+                    "Seed Term": st.column_config.TextColumn("Source", width="small"),
                 }
             )
             
@@ -299,7 +310,7 @@ if run_btn and keyword and api_key:
             st.warning("No keywords found. Google Autocomplete returned 0 results for these terms.")
         
     else:
-        st.error("AI Analysis Failed. Please check your API Key quota or try again.")
+        st.error("AI Analysis Failed. Please check your API Key quota.")
 
-elif run_btn:
+elif run_btn and not api_key:
     st.error("Enter API Key and Keyword.")
