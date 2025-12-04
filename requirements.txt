@@ -4,3 +4,5 @@ requests
 plotly
 google-generativeai
 pytrends
+sentence-transformers
+scikit-learn
