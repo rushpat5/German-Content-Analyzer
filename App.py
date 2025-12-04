@@ -15,7 +15,6 @@ st.set_page_config(page_title="Cross-Border Keyword Bridge", layout="wide", page
 
 st.markdown("""
 <style>
-    /* --- FORCE LIGHT MODE --- */
     :root { --primary-color: #1a7f37; --background-color: #ffffff; --secondary-background-color: #f6f8fa; --text-color: #24292e; }
     .stApp { background-color: #ffffff; color: #24292e; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
     
@@ -26,18 +25,15 @@ st.markdown("""
         background: #ffffff; border: 1px solid #e1e4e8; border-radius: 8px; padding: 20px; text-align: center;
         box-shadow: 0 1px 3px rgba(0,0,0,0.02); margin-bottom: 10px;
     }
-    .metric-val { font-size: 1.8rem; font-weight: 700; color: #1a7f37; margin-bottom: 5px; }
+    .metric-val { font-size: 1.5rem; font-weight: 700; color: #1a7f37; margin-bottom: 5px; }
     .metric-lbl { font-size: 0.8rem; color: #586069; text-transform: uppercase; letter-spacing: 0.5px; }
     
-    /* Tables */
-    [data-testid="stDataFrame"] { border: 1px solid #e1e4e8; }
-
     /* Sidebar */
     section[data-testid="stSidebar"] { background-color: #f6f8fa; border-right: 1px solid #d0d7de; }
     .stTextInput input { background-color: #ffffff !important; border: 1px solid #d0d7de !important; color: #24292e !important; }
-    .stTextInput input:focus { border-color: #1a7f37 !important; }
     
     #MainMenu {visibility: hidden;} footer {visibility: hidden;}
+    [data-testid="stDataFrame"] { border: 1px solid #e1e4e8; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -46,153 +42,147 @@ st.markdown("""
 # -----------------------------------------------------------------------------
 
 def get_valid_model(api_key):
-    """Dynamically finds a working model for the API key."""
     genai.configure(api_key=api_key)
     try:
         models = list(genai.list_models())
-        valid_models = [m for m in models if 'generateContent' in m.supported_generation_methods]
-        
-        # Priority: Flash > Pro > Generic
-        for m in valid_models:
-            if 'flash' in m.name and '1.5' in m.name: return m.name
-        for m in valid_models:
-            if 'pro' in m.name and '1.5' in m.name: return m.name
-        for m in valid_models:
-            if 'gemini' in m.name: return m.name
-            
-        return "models/gemini-pro" # Fallback
+        valid = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+        for m in valid:
+            if 'flash' in m and '1.5' in m: return m
+        return "models/gemini-pro"
     except:
         return "models/gemini-pro"
 
-def get_cultural_translation(api_key, keyword):
-    """Uses Gemini to get the SEO-Native German translation."""
+def get_synonyms_strategy(api_key, keyword):
+    """
+    Asks AI for ALL valid German variations (Synonyms) to ensure we don't miss traffic.
+    """
     try:
-        # 1. Find Model
         model_name = get_valid_model(api_key)
         model = genai.GenerativeModel(model_name)
         
         prompt = f"""
-        Act as a Native German SEO Expert.
+        Act as a German Native SEO.
         English Keyword: "{keyword}"
         
-        Task:
-        1. Provide the most common 'Search Term' used in Germany for this concept (The "Head Term").
-        2. Provide 3 related English keywords and their German equivalents.
+        Task: Identify the top 3 distinct German terms used for this concept. 
+        Include colloquial terms, medical terms, or synonyms if they are searched.
         
-        Return raw JSON only:
+        Example for "Diaper Rash": ["Wunder Po", "Windeldermatitis", "Wundsein"]
+        Example for "Cell Phone": ["Handy", "Smartphone", "Mobiltelefon"]
+        
+        Return raw JSON:
         {{
-            "primary_german": "keyword",
-            "related_english": [
-                {{"en": "rel1", "de": "trans1"}},
-                {{"en": "rel2", "de": "trans2"}},
-                {{"en": "rel3", "de": "trans3"}}
-            ]
+            "synonyms": ["term1", "term2", "term3"],
+            "explanation": "Brief reason for these choices"
         }}
         """
         resp = model.generate_content(prompt)
-        
-        # Robust Clean
-        clean_text = resp.text
-        if "```" in clean_text:
-            clean_text = re.sub(r"```json|```", "", clean_text).strip()
-            
-        return json.loads(clean_text)
-    except Exception as e:
-        st.error(f"API Error: {str(e)}")
+        text = re.sub(r"```json|```", "", resp.text).strip()
+        return json.loads(text)
+    except:
         return None
 
-def fetch_suggestions(query, lang='de', gl='de'):
-    """Base function to hit Google Suggest."""
-    url = f"http://google.com/complete/search?client=chrome&q={query}&hl={lang}&gl={gl}"
+def batch_translate_to_english(api_key, german_keywords):
+    """
+    Translates a list of German keywords back to English for the user.
+    """
+    if not german_keywords: return {}
+    
     try:
-        response = requests.get(url, timeout=2)
-        if response.status_code == 200:
-            return response.json()[1]
+        model_name = get_valid_model(api_key)
+        model = genai.GenerativeModel(model_name)
+        
+        # We process top 50 to save time/tokens, or all if small
+        targets = german_keywords[:80]
+        
+        prompt = f"""
+        Translate these German search queries into English. Keep it short.
+        Input List: {json.dumps(targets)}
+        
+        Return raw JSON key-value pairs:
+        {{
+            "German Keyword": "English Translation"
+        }}
+        """
+        resp = model.generate_content(prompt)
+        text = re.sub(r"```json|```", "", resp.text).strip()
+        return json.loads(text)
     except:
-        pass
+        return {}
+
+def fetch_suggestions(query):
+    url = f"http://google.com/complete/search?client=chrome&q={query}&hl=de&gl=de"
+    try:
+        r = requests.get(url, timeout=2)
+        if r.status_code == 200: return r.json()[1]
+    except: pass
     return []
 
-def get_deep_mining_suggestions(base_keyword):
+def deep_mine_synonyms(synonyms):
     """
-    The 'Alphabet Soup' Method.
-    Appends German modifiers to force Google to reveal low-volume / long-tail queries.
+    Runs the Recursive Mining on MULTIPLE synonyms (Multi-Seed Mining).
     """
-    # Strategic German Modifiers
-    modifiers = [
-        "",          # Raw (High Volume)
-        " für",      # for (Specific Use Case)
-        " bei",      # with/during (Condition)
-        " gegen",    # against (Remedy)
-        " ohne",     # without (Exclusion)
-        " wann",     # when (Question)
-        " was",      # what (Definition)
-        " hausmittel", # home remedy (German favorite)
-        " test",     # review
-        " kaufen"    # transactional
-    ]
+    # German modifiers to force long-tail
+    modifiers = ["", " für", " bei", " gegen", " was", " wann", " hausmittel", " kosten", " tipps"]
     
-    all_results = []
+    all_data = []
     
-    # Progress bar container
-    progress_text = "Mining Google Suggestions..."
-    my_bar = st.progress(0, text=progress_text)
+    progress_bar = st.progress(0, text="Initializing Mining...")
+    total_steps = len(synonyms) * len(modifiers)
+    step = 0
     
-    for i, mod in enumerate(modifiers):
-        # Update progress
-        my_bar.progress((i + 1) / len(modifiers), text=f"Mining: '{base_keyword}{mod}...'")
-        
-        search_term = f"{base_keyword}{mod}"
-        results = fetch_suggestions(search_term)
-        
-        for r in results:
-            # Categorize intent based on modifier
-            intent = "General / Head"
-            if "für" in mod: intent = "Specific Use"
-            elif "gegen" in mod: intent = "Problem Solving"
-            elif "hausmittel" in mod: intent = "Informational (Remedy)"
-            elif "kaufen" in mod: intent = "Transactional"
-            elif "test" in mod: intent = "Commercial Investigation"
-            elif "wann" in mod or "was" in mod: intent = "Informational (Q&A)"
+    for seed in synonyms:
+        for mod in modifiers:
+            step += 1
+            progress_bar.progress(step / total_steps, text=f"Mining Google.de: '{seed}{mod}'...")
             
-            all_results.append({"Keyword": r, "Source Context": f"'{mod.strip()}' modifier", "Intent": intent})
-        
-        time.sleep(0.1) # Be nice to Google API
-        
-    my_bar.empty()
+            query = f"{seed}{mod}"
+            results = fetch_suggestions(query)
+            
+            intent = "General"
+            if "für" in mod: intent = "Use Case"
+            elif "gegen" in mod: intent = "Problem Solving"
+            elif "hausmittel" in mod: intent = "DIY / Remedies"
+            elif "wann" in mod: intent = "Informational"
+            
+            for r in results:
+                all_data.append({
+                    "German Keyword": r,
+                    "Seed Term": seed,
+                    "Intent": intent
+                })
+            
+            time.sleep(0.05) # Rate limit safety
+            
+    progress_bar.empty()
     
     # Deduplicate
-    df = pd.DataFrame(all_results)
+    df = pd.DataFrame(all_data)
     if not df.empty:
-        df = df.drop_duplicates(subset=['Keyword'])
+        df = df.drop_duplicates(subset=['German Keyword'])
     return df
 
-def get_google_trends(keywords):
-    """Fetches relative search volume (0-100)."""
+def get_trend(keyword):
     try:
         pytrends = TrendReq(hl='de-DE', tz=360)
-        target = keywords[:1] 
-        pytrends.build_payload(target, cat=0, timeframe='today 12-m', geo='DE', gprop='')
+        pytrends.build_payload([keyword], cat=0, timeframe='today 12-m', geo='DE')
         data = pytrends.interest_over_time()
-        if not data.empty:
-            return data.drop(columns=['isPartial'])
-    except:
-        return None
+        if not data.empty: return data.drop(columns=['isPartial'])
+    except: return None
     return None
 
 # -----------------------------------------------------------------------------
 # 3. SIDEBAR
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### ⚙️ Intelligence Config")
+    st.markdown("### ⚙️ Engine Config")
     api_key = st.text_input("Gemini API Key", type="password")
-    st.markdown("""<a href="https://aistudio.google.com/app/apikey" target="_blank" style="font-size:0.8rem;color:#0969da;">🔑 Get Free Key</a>""", unsafe_allow_html=True)
     
     st.markdown("---")
     st.markdown("""
-    **Methodology:**
     <div class="tech-note">
-    <b>1. Cultural Translation:</b> We use LLMs to find the "Native" term (e.g. "Handy" vs "Mobiltelefon").
-    <br><b>2. Recursive Mining:</b> We iterate through German prepositions (<i>für, gegen, bei</i>) to force Google Autocomplete to reveal deep long-tail queries.
+    <b>Multi-Seed Mining:</b> 
+    We don't just translate once. We find the top 3 German variations (e.g. <i>Baby, Säugling, Neugeborenes</i>) and mine Google Autocomplete for ALL of them to ensure 100% coverage.
     </div>
     """, unsafe_allow_html=True)
 
@@ -203,104 +193,84 @@ with st.sidebar:
 st.title("Cross-Border Keyword Bridge 🇩🇪")
 st.markdown("### German Long-Tail Intelligence & Strategy")
 
-with st.expander("How this tool works (Technical)", expanded=False):
-    st.markdown("""
-    **The Problem:** Direct translation misses search intent. "Diaper Rash" translates to "Windelausschlag" (Medical), but Germans search for "Wunder Po" (Colloquial).
-    
-    **The Solution:**
-    1.  **AI Context:** We identify the colloquial "Money Keyword."
-    2.  **Deep Scraping:** We use the "Alphabet Soup" method on Google Germany to find low-volume, high-intent long tails.
-    3.  **Trend Validation:** We check seasonality using Google Trends data.
-    """)
-
-st.write("")
-keyword = st.text_input("Enter English Keyword", placeholder="e.g. diaper rash")
+keyword = st.text_input("Enter English Keyword", placeholder="e.g. newborn babies")
 run_btn = st.button("Generate German Strategy", type="primary")
 
 if run_btn and keyword and api_key:
     
-    # --- PHASE 1: TRANSLATION ---
-    with st.spinner("Consulting German SEO Database..."):
-        ai_data = get_cultural_translation(api_key, keyword)
+    # 1. Identify Synonyms
+    with st.spinner("Consulting German Lexicon..."):
+        strategy = get_synonyms_strategy(api_key, keyword)
     
-    if ai_data:
-        primary_de = ai_data['primary_german']
+    if strategy:
+        synonyms = strategy['synonyms']
         
-        # --- PHASE 2: DEEP MINING ---
-        df_suggestions = get_deep_mining_suggestions(primary_de)
+        # 2. Deep Mine (Multi-Seed)
+        df_keywords = deep_mine_synonyms(synonyms)
         
-        # --- PHASE 3: TRENDS ---
-        with st.spinner("Fetching Demand Trends..."):
-            trend_data = get_google_trends([primary_de])
+        # 3. Back-Translate Top Results
+        with st.spinner(f"Translating {len(df_keywords)} keywords back to English for you..."):
+            # Extract list of german words to translate
+            germ_list = df_keywords['German Keyword'].tolist()
+            translations = batch_translate_to_english(api_key, germ_list)
+            
+            # Map back to dataframe
+            df_keywords['English Meaning'] = df_keywords['German Keyword'].map(translations).fillna("-")
 
-        # --- DASHBOARD ---
-        st.markdown("---")
-        st.subheader("1. Strategic Translation")
-        
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown(f"""<div class="metric-card"><div class="metric-val" style="color:#24292e;">{keyword}</div><div class="metric-lbl">English Input</div></div>""", unsafe_allow_html=True)
-        with c2:
-             st.markdown(f"""<div class="metric-card" style="border-left: 5px solid #1a7f37;"><div class="metric-val">{primary_de}</div><div class="metric-lbl">German Head Term</div></div>""", unsafe_allow_html=True)
-        with c3:
-             count = len(df_suggestions) if not df_suggestions.empty else 0
-             st.markdown(f"""<div class="metric-card"><div class="metric-val">{count}</div><div class="metric-lbl">Variations Found</div></div>""", unsafe_allow_html=True)
+        # 4. Get Trends for the main synonym
+        main_term = synonyms[0]
+        trend_data = get_trend(main_term)
 
-        # --- TREND CHART ---
+        # --- OUTPUT ---
         st.markdown("---")
-        st.subheader(f"2. Demand Trend (Head Term)")
-        st.markdown(f"Relative interest in **Germany** over the last 12 months.")
         
+        # A. Strategy Header
+        st.markdown(f"### 1. Strategy: {keyword}")
+        st.markdown(f"**AI Insight:** {strategy['explanation']}")
+        
+        cols = st.columns(len(synonyms))
+        for i, syn in enumerate(synonyms):
+            cols[i].markdown(f"""
+            <div class="metric-card">
+                <div class="metric-val">{syn}</div>
+                <div class="metric-lbl">German Variation #{i+1}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        # B. Trend
+        st.markdown("---")
+        st.subheader("2. Seasonality (Google Trends)")
         if trend_data is not None:
-            fig = px.line(trend_data, y=primary_de, title=f"Demand: '{primary_de}'",
-                          color_discrete_sequence=['#1a7f37'])
+            fig = px.line(trend_data, y=main_term, title=f"Interest in '{main_term}' (Germany)", color_discrete_sequence=['#1a7f37'])
             fig.update_layout(plot_bgcolor='white', yaxis=dict(gridcolor='#f0f0f0'))
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("Trend data not available for this specific term (Volume might be low/stable).")
+            st.info("Trend data unavailable for this specific term.")
 
-        # --- LONG TAIL TABLE ---
+        # C. The Master Matrix
         st.markdown("---")
-        st.subheader("3. The Long-Tail Matrix")
-        st.markdown("Real queries scraped from Google Germany. Use these for **H2s** and **FAQ** sections.")
+        st.subheader(f"3. The Master Matrix ({len(df_keywords)} Keywords)")
+        st.markdown("We combined results from all German variations into one list, translated back to English for you.")
         
-        if not df_suggestions.empty:
-            # Intent Filter
-            intents = ["All"] + list(df_suggestions['Intent'].unique())
-            selected_intent = st.selectbox("Filter by Intent:", intents)
-            
-            if selected_intent != "All":
-                df_display = df_suggestions[df_suggestions['Intent'] == selected_intent]
-            else:
-                df_display = df_suggestions
-
-            st.dataframe(
-                df_display, 
-                use_container_width=True, 
-                hide_index=True,
-                column_config={
-                    "Keyword": st.column_config.TextColumn("German Keyword", width="large"),
-                    "Source Context": st.column_config.TextColumn("Discovery Modifier"),
-                }
-            )
-            
-            csv = df_suggestions.to_csv(index=False).encode('utf-8')
-            st.download_button("Download Keyword List (CSV)", csv, "german_keywords.csv", "text/csv")
-        else:
-            st.warning("No suggestions found. The keyword might be too niche even for Google Suggest.")
-
-        # --- MAPPINGS ---
-        st.markdown("---")
-        st.subheader("4. English Reference Mappings")
-        st.caption("Use these to explain the keywords to English-speaking stakeholders.")
+        # Reorder columns for readability
+        df_display = df_keywords[['German Keyword', 'English Meaning', 'Intent', 'Seed Term']]
         
-        rel_data = []
-        for r in ai_data['related_english']:
-            rel_data.append({"English Concept": r['en'], "German Equivalent": r['de']})
-        st.dataframe(pd.DataFrame(rel_data), use_container_width=True, hide_index=True)
-
+        st.dataframe(
+            df_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "German Keyword": st.column_config.TextColumn("🇩🇪 German Query", width="medium"),
+                "English Meaning": st.column_config.TextColumn("🇺🇸 English Meaning", width="medium"),
+                "Seed Term": st.column_config.TextColumn("Source Synonym", width="small"),
+            }
+        )
+        
+        csv = df_display.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Master List (CSV)", csv, "german_strategy.csv", "text/csv")
+        
     else:
-        st.error("AI Translation Failed. Please check API Key and ensure Quota is available.")
+        st.error("AI Analysis Failed. Please check API Key.")
 
-elif run_btn and not api_key:
-    st.error("Please enter a Gemini API Key in the sidebar.")
+elif run_btn:
+    st.error("Enter API Key and Keyword.")
