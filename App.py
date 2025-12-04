@@ -6,6 +6,7 @@ import time
 import google.generativeai as genai
 from pytrends.request import TrendReq
 import plotly.express as px
+import re
 
 # -----------------------------------------------------------------------------
 # 1. VISUAL CONFIGURATION (Dejan Style)
@@ -15,11 +16,10 @@ st.set_page_config(page_title="Cross-Border Keyword Bridge", layout="wide", page
 st.markdown("""
 <style>
     /* --- FORCE LIGHT MODE --- */
-    :root { --primary-color: #1a7f37; --background-color: #ffffff; --secondary-background-color: #f6f8fa; --text-color: #24292e; --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
-    .stApp { background-color: #ffffff; color: #24292e; }
+    :root { --primary-color: #1a7f37; --background-color: #ffffff; --secondary-background-color: #f6f8fa; --text-color: #24292e; }
+    .stApp { background-color: #ffffff; color: #24292e; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
     
-    h1, h2, h3, h4 { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; font-weight: 600; color: #111; letter-spacing: -0.3px; }
-    p, li, span, div { color: #24292e; }
+    h1, h2, h3 { color: #111; font-weight: 600; letter-spacing: -0.5px; }
     
     /* Metric Cards */
     .metric-card {
@@ -29,19 +29,15 @@ st.markdown("""
     .metric-val { font-size: 1.8rem; font-weight: 700; color: #1a7f37; margin-bottom: 5px; }
     .metric-lbl { font-size: 0.8rem; color: #586069; text-transform: uppercase; letter-spacing: 0.5px; }
     
+    /* Tables */
+    [data-testid="stDataFrame"] { border: 1px solid #e1e4e8; }
+
     /* Sidebar */
     section[data-testid="stSidebar"] { background-color: #f6f8fa; border-right: 1px solid #d0d7de; }
-    section[data-testid="stSidebar"] * { color: #24292e !important; }
+    .stTextInput input { background-color: #ffffff !important; border: 1px solid #d0d7de !important; color: #24292e !important; }
+    .stTextInput input:focus { border-color: #1a7f37 !important; }
     
-    /* Inputs */
-    .stTextInput input { background-color: #ffffff !important; border: 1px solid #d0d7de !important; color: #24292e !important; border-radius: 6px; }
-    .stTextInput input:focus { border-color: #1a7f37 !important; box-shadow: 0 0 0 1px #1a7f37 !important; }
-    
-    /* Tech Note */
-    .tech-note { font-size: 0.85rem; color: #57606a; background-color: #f6f8fa; border-left: 3px solid #0969da; padding: 12px; border-radius: 0 4px 4px 0; }
-    
-    #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
-    [data-testid="stDataFrame"] { border: 1px solid #e1e4e8; }
+    #MainMenu {visibility: hidden;} footer {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -49,11 +45,31 @@ st.markdown("""
 # 2. LOGIC ENGINE
 # -----------------------------------------------------------------------------
 
+def get_valid_model(api_key):
+    """Dynamically finds a working model for the API key."""
+    genai.configure(api_key=api_key)
+    try:
+        models = list(genai.list_models())
+        valid_models = [m for m in models if 'generateContent' in m.supported_generation_methods]
+        
+        # Priority: Flash > Pro > Generic
+        for m in valid_models:
+            if 'flash' in m.name and '1.5' in m.name: return m.name
+        for m in valid_models:
+            if 'pro' in m.name and '1.5' in m.name: return m.name
+        for m in valid_models:
+            if 'gemini' in m.name: return m.name
+            
+        return "models/gemini-pro" # Fallback
+    except:
+        return "models/gemini-pro"
+
 def get_cultural_translation(api_key, keyword):
     """Uses Gemini to get the SEO-Native German translation."""
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # 1. Find Model
+        model_name = get_valid_model(api_key)
+        model = genai.GenerativeModel(model_name)
         
         prompt = f"""
         Act as a Native German SEO Expert.
@@ -74,9 +90,15 @@ def get_cultural_translation(api_key, keyword):
         }}
         """
         resp = model.generate_content(prompt)
-        clean_text = resp.text.replace("```json", "").replace("```", "").strip()
+        
+        # Robust Clean
+        clean_text = resp.text
+        if "```" in clean_text:
+            clean_text = re.sub(r"```json|```", "", clean_text).strip()
+            
         return json.loads(clean_text)
     except Exception as e:
+        st.error(f"API Error: {str(e)}")
         return None
 
 def fetch_suggestions(query, lang='de', gl='de'):
@@ -278,7 +300,7 @@ if run_btn and keyword and api_key:
         st.dataframe(pd.DataFrame(rel_data), use_container_width=True, hide_index=True)
 
     else:
-        st.error("AI Translation Failed. Please check API Key.")
+        st.error("AI Translation Failed. Please check API Key and ensure Quota is available.")
 
 elif run_btn and not api_key:
     st.error("Please enter a Gemini API Key in the sidebar.")
