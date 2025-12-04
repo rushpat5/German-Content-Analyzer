@@ -37,15 +37,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. SESSION STATE INITIALIZATION (Fixes the Reset Bug)
+# 2. SESSION STATE INITIALIZATION
 # -----------------------------------------------------------------------------
 if 'data_processed' not in st.session_state:
     st.session_state.data_processed = False
     st.session_state.df_clustered = None
-    st.session_state.df_direct = None # For exact variations
+    st.session_state.df_direct = None 
     st.session_state.synonyms = []
     st.session_state.strategy_text = ""
-    st.session_state.briefs = {} # Store generated briefs
+    st.session_state.briefs = {} 
 
 # -----------------------------------------------------------------------------
 # 3. VECTOR ENGINE
@@ -82,8 +82,7 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     df_relevant = df_keywords[df_keywords['Relevance'] >= threshold].copy()
     
     # --- B. SPLITTING (Direct vs Broad) ---
-    # Direct Variations: Extremely high similarity (>0.82) OR contains exact seed word
-    # We use 0.82 as a heuristic for "Basically the same word" in Gemma space
+    # Direct Variations: Extremely high similarity (>0.82)
     df_direct = df_relevant[df_relevant['Relevance'] > 0.82].copy()
     df_clusters = df_relevant[df_relevant['Relevance'] <= 0.82].copy()
     
@@ -103,6 +102,8 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
         df_clusters['Cluster Name'] = df_clusters['Cluster ID'].map(cluster_names)
     else:
         df_clusters['Cluster Name'] = "General"
+        # Handle empty case if everything went to Direct
+        if 'Cluster ID' not in df_clusters.columns: df_clusters['Cluster ID'] = 0
 
     return df_direct.sort_values('Relevance', ascending=False), df_clusters.sort_values('Cluster ID')
 
@@ -111,11 +112,9 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
 # -----------------------------------------------------------------------------
 def run_gemini(api_key, prompt):
     genai.configure(api_key=api_key)
-    # Dynamic Model Selection
     try:
         models = list(genai.list_models())
         valid = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        # Priority: Flash -> Pro
         chosen = next((m for m in valid if 'flash' in m), next((m for m in valid if 'pro' in m), "models/gemini-1.5-flash"))
         
         model = genai.GenerativeModel(chosen)
@@ -123,7 +122,7 @@ def run_gemini(api_key, prompt):
         text = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except Exception as e:
-        if "429" in str(e): time.sleep(1); return run_gemini(api_key, prompt) # Simple retry
+        if "429" in str(e): time.sleep(1); return run_gemini(api_key, prompt)
         return {"error": str(e)}
 
 def get_cultural_translation(api_key, keyword):
@@ -212,8 +211,12 @@ with st.sidebar:
     st.markdown("### ⚙️ Engine Config")
     api_key = st.text_input("Gemini API Key", type="password")
     hf_token = st.text_input("Hugging Face Token", type="password")
+    st.markdown("""
+    <a href="https://aistudio.google.com/app/apikey" target="_blank" style="font-size:0.8rem;">🔑 Gemini Key</a> | 
+    <a href="https://huggingface.co/settings/tokens" target="_blank" style="font-size:0.8rem;">🤗 HF Token</a>
+    """, unsafe_allow_html=True)
     st.markdown("---")
-    threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.55, 0.05)
+    threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.50, 0.05)
 
 st.title("German Vector Strategist 🇩🇪")
 st.markdown("### Cross-Border Intelligence")
@@ -226,7 +229,6 @@ with col_btn:
 
 # --- EXECUTION LOGIC ---
 if run_btn and keyword and api_key and hf_token:
-    # Reset State
     st.session_state.data_processed = False
     st.session_state.briefs = {}
 
@@ -262,23 +264,17 @@ if run_btn and keyword and api_key and hf_token:
             
             if not df_clustered.empty:
                 df_clustered['English'] = df_clustered['German Keyword'].map(trans_map).fillna("-")
-                
-                # Trends (Only for clusters)
                 trends = fetch_smart_trends(df_clustered)
                 df_clustered['Trend'] = df_clustered['German Keyword'].map(trends).fillna("-")
 
-        # Save to Session State
         st.session_state.df_direct = df_direct
         st.session_state.df_clustered = df_clustered
         st.session_state.data_processed = True
-        
     else:
         st.warning("No keywords found.")
 
-# --- RENDER RESULTS FROM STATE ---
+# --- RENDER RESULTS ---
 if st.session_state.data_processed:
-    
-    # Header Info
     st.info(f"**Cultural Context:** {st.session_state.strategy_text}")
     cols = st.columns(len(st.session_state.synonyms))
     for i, syn in enumerate(st.session_state.synonyms):
@@ -286,48 +282,46 @@ if st.session_state.data_processed:
     
     st.write("---")
     
-    # --- SECTION 1: DIRECT VARIATIONS ---
+    # SECTION 1: DIRECT
     st.subheader("1. Direct Variations (Exact Match Intent)")
-    st.markdown("Keywords that mean *exactly* what you searched for, just phrased differently.")
-    
     if st.session_state.df_direct is not None and not st.session_state.df_direct.empty:
         st.dataframe(
             st.session_state.df_direct[['German Keyword', 'English', 'Relevance']],
-            use_container_width=True,
-            hide_index=True,
+            use_container_width=True, hide_index=True,
             column_config={"Relevance": st.column_config.ProgressColumn("Vector Match", format="%.2f", min_value=0, max_value=1)}
         )
     else:
-        st.info("No direct variations found. Topic might be very specific.")
+        st.info("No direct variations found.")
 
-    # --- SECTION 2: TOPIC CLUSTERS ---
+    # SECTION 2: CLUSTERS
     st.markdown("---")
     st.subheader("2. Thematic Content Clusters")
-    st.markdown("Broader keywords grouped by intent. Each cluster is a potential article.")
-    
     if st.session_state.df_clustered is not None and not st.session_state.df_clustered.empty:
         clusters = st.session_state.df_clustered['Cluster Name'].unique()
         
         for c_name in clusters:
             c_data = st.session_state.df_clustered[st.session_state.df_clustered['Cluster Name'] == c_name]
             keywords_list = c_data['German Keyword'].tolist()
+            eng_title = c_data.iloc[0]['English'] if not c_data.empty else ""
             
-            # Get English Translation of Cluster Name from the first keyword row
-            english_title = c_data.iloc[0]['English'] if not c_data.empty else "Unknown"
-            
-            with st.expander(f"📁 {c_name} ({english_title}) - {len(c_data)} kw"):
+            with st.expander(f"📁 {c_name} ({eng_title}) - {len(c_data)} kw"):
                 c1, c2 = st.columns([2, 1])
                 with c1:
-                    st.dataframe(c_data[['German Keyword', 'English', 'Trend']], use_container_width=True, hide_index=True)
-                
+                    # ADDED 'Relevance' HERE
+                    st.dataframe(
+                        c_data[['German Keyword', 'English', 'Trend', 'Relevance']], 
+                        use_container_width=True, 
+                        hide_index=True,
+                        column_config={
+                            "Relevance": st.column_config.ProgressColumn("Relevance", format="%.2f", min_value=0, max_value=1)
+                        }
+                    )
                 with c2:
-                    # Brief Generation Logic
                     if st.button(f"✨ Draft Brief", key=f"btn_{c_name}"):
                         with st.spinner("Drafting..."):
                             brief = generate_brief(api_key, c_name, keywords_list[:8])
-                            st.session_state.briefs[c_name] = brief # Store it
+                            st.session_state.briefs[c_name] = brief
                     
-                    # Show stored brief if exists
                     if c_name in st.session_state.briefs:
                         b = st.session_state.briefs[c_name]
                         if "error" not in b:
@@ -336,10 +330,8 @@ if st.session_state.data_processed:
                             st.caption(f"({b.get('h1_english')})")
                             for s in b.get('outline', []):
                                 st.markdown(f"- {s.get('h2')}")
-                        else:
-                            st.error("Failed to generate.")
+                        else: st.error("Failed.")
 
-        # Export
         st.markdown("---")
         csv = st.session_state.df_clustered.to_csv(index=False).encode('utf-8')
         st.download_button("Download Cluster Data (CSV)", csv, "german_clusters.csv", "text/csv")
