@@ -46,44 +46,60 @@ st.markdown("""
 # 2. LOGIC ENGINE
 # -----------------------------------------------------------------------------
 
-def run_gemini_prompt(api_key, prompt):
+def get_best_available_model(api_key):
     """
-    Robustly tries multiple model versions until one succeeds.
+    Dynamically asks Google which models are available to this Key
+    and picks the best one (Flash > Pro > Others).
     """
     genai.configure(api_key=api_key)
-    
-    # List of models to try in order of preference (Fastest -> Smartest -> Legacy)
-    candidates = [
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-pro",
-        "gemini-1.5-pro-latest",
-        "gemini-1.0-pro"
-    ]
-    
-    last_error = None
-    
-    for model_name in candidates:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            
-            # Clean output
-            text = response.text
-            if "```" in text:
-                text = re.sub(r"```json|```", "", text).strip()
+    try:
+        # 1. List all models the key can access
+        all_models = list(genai.list_models())
+        
+        # 2. Filter for text generation models
+        text_models = [m for m in all_models if 'generateContent' in m.supported_generation_methods]
+        
+        # 3. Priority Selection
+        # Try to find Flash first (Fast/Free)
+        for m in text_models:
+            if 'flash' in m.name.lower() and '1.5' in m.name:
+                return m.name
+        
+        # Try Pro 1.5
+        for m in text_models:
+            if 'pro' in m.name.lower() and '1.5' in m.name:
+                return m.name
                 
-            return json.loads(text)
+        # Fallback to any Gemini model found
+        for m in text_models:
+            if 'gemini' in m.name.lower():
+                return m.name
+                
+        # Ultimate Fallback (Blind Guess)
+        return "models/gemini-1.5-flash"
+        
+    except Exception as e:
+        # If list_models fails (permissions), default to Flash
+        return "models/gemini-1.5-flash"
+
+def run_gemini_prompt(api_key, prompt):
+    # Find the working model name dynamically
+    model_name = get_best_available_model(api_key)
+    # st.toast(f"Using Model: {model_name}") # Optional debug
+    
+    try:
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(prompt)
+        
+        # Clean output
+        text = response.text
+        if "```" in text:
+            text = re.sub(r"```json|```", "", text).strip()
             
-        except Exception as e:
-            last_error = e
-            # If it's a quota error (429), wait briefly then try next model
-            if "429" in str(e):
-                time.sleep(1)
-            continue
-            
-    # If we reach here, all models failed
-    raise Exception(f"All AI models failed. Last error: {str(last_error)}")
+        return json.loads(text)
+        
+    except Exception as e:
+        raise Exception(f"Model ({model_name}) Failed: {str(e)}")
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
@@ -105,7 +121,7 @@ def get_cultural_translation(api_key, keyword):
     try:
         return run_gemini_prompt(api_key, prompt)
     except Exception as e:
-        st.error(f"Translation Error: {str(e)}")
+        st.error(f"AI Error: {str(e)}")
         return None
 
 def batch_translate_to_english(api_key, german_keywords):
@@ -125,7 +141,7 @@ def batch_translate_to_english(api_key, german_keywords):
     """
     try:
         return run_gemini_prompt(api_key, prompt)
-    except Exception as e:
+    except:
         return {}
 
 def fetch_suggestions(query):
@@ -181,10 +197,8 @@ def deep_mine_synonyms(synonyms):
     return df
 
 def get_google_trends(keywords):
-    """Fetches relative search volume (0-100)."""
     try:
         pytrends = TrendReq(hl='de-DE', tz=360)
-        # Only take top 1 for trend graph
         target = keywords[:1] 
         pytrends.build_payload(target, cat=0, timeframe='today 12-m', geo='DE', gprop='')
         time.sleep(0.5)
@@ -207,7 +221,7 @@ with st.sidebar:
     st.markdown("""
     <div class="tech-note">
     <b>Methodology:</b>
-    <br>1. <b>Synonym Generation:</b> Uses <code>Gemini 1.5 Flash</code> to find Native German variations.
+    <br>1. <b>Synonym Generation:</b> Auto-detects 3 variations (Colloquial, Medical, Synonym).
     <br>2. <b>Multi-Seed Mining:</b> Recursive scraping of Google Autocomplete for all variations.
     <br>3. <b>Back-Translation:</b> Uses AI to translate findings back to English.
     </div>
@@ -266,19 +280,17 @@ if run_btn and keyword and api_key:
             
         # Trends
         st.markdown("---")
-        st.subheader(f"2. Demand Trend: '{main_term}'")
+        st.subheader("2. Demand Trend")
         if trend_data is not None:
-            fig = px.line(trend_data, y=main_term, title="Relative Search Interest (Last 12 Months)",
-                          color_discrete_sequence=['#1a7f37'])
+            fig = px.line(trend_data, y=main_term, title=f"Interest in '{main_term}' (Germany)", color_discrete_sequence=['#1a7f37'])
             fig.update_layout(plot_bgcolor='white', yaxis=dict(gridcolor='#f0f0f0'))
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("Trend data unavailable (Google Trends API limit or low volume).")
+            st.warning("Trend data unavailable (Google Trends API limits or low volume).")
 
         # Matrix
         st.markdown("---")
         st.subheader(f"3. The Master Matrix ({len(df_keywords)} Keywords)")
-        st.markdown("Real queries scraped from Google Germany.")
         
         if not df_keywords.empty:
             # Filter
@@ -310,6 +322,7 @@ if run_btn and keyword and api_key:
             st.warning("No keywords found. Google Autocomplete returned 0 results for these terms.")
         
     else:
+        # This error now only shows if ALL models failed
         st.error("AI Analysis Failed. Please check your API Key quota.")
 
 elif run_btn and not api_key:
