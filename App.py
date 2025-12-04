@@ -76,39 +76,54 @@ def cluster_keywords(df_keywords):
     return df_keywords.sort_values('Cluster ID')
 
 # -----------------------------------------------------------------------------
-# 3. GENERATIVE ENGINE (Brute Force Selector)
+# 3. GENERATIVE ENGINE (Dynamic Discovery)
 # -----------------------------------------------------------------------------
 
-def run_gemini(api_key, prompt):
+def get_best_model_name(api_key):
+    """
+    Dynamically asks Google which models are available to this Key
+    and picks the best one.
+    """
     genai.configure(api_key=api_key)
-    
-    # List of models to try (Priority order)
-    candidates = [
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-pro",
-        "gemini-1.0-pro",
-        "gemini-pro"
-    ]
-    
-    last_err = ""
-    
-    for model_name in candidates:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
+    try:
+        # 1. List all models
+        all_models = list(genai.list_models())
+        
+        # 2. Filter for text generation support
+        valid_models = [m for m in all_models if 'generateContent' in m.supported_generation_methods]
+        
+        if not valid_models:
+            return "models/gemini-1.5-flash" # Fallback
             
-            # Clean Markdown
-            text = response.text.replace("```json", "").replace("```", "").strip()
-            # Fix common JSON trailing commas errors if any
-            return json.loads(text)
-        except Exception as e:
-            last_err = str(e)
-            # If quota error (429), wait a bit and try next
-            if "429" in str(e): time.sleep(1)
-            continue
+        # 3. Selection Strategy
+        # Priority: Flash (Fast) > Pro (Smart) > Any
+        for m in valid_models:
+            if 'flash' in m.name.lower() and '1.5' in m.name: return m.name
             
-    return {"error": f"All models failed. Last error: {last_err}"}
+        for m in valid_models:
+            if 'pro' in m.name.lower() and '1.5' in m.name: return m.name
+            
+        # Fallback to first valid model found
+        return valid_models[0].name
+        
+    except Exception as e:
+        # If listing fails, guess the most standard one
+        return "models/gemini-1.5-flash"
+
+def run_gemini(api_key, prompt):
+    try:
+        # Dynamically find model
+        model_name = get_best_model_name(api_key)
+        model = genai.GenerativeModel(model_name)
+        
+        response = model.generate_content(prompt)
+        
+        # Clean Markdown
+        text = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+        
+    except Exception as e:
+        return {"error": str(e)}
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
@@ -140,14 +155,14 @@ def batch_validate_translate(api_key, keywords, topic):
         
         Task:
         1. Translate to English.
-        2. "keep": false if it is a Brand Name (e.g. DM, Rossmann, Amazon), a specific Store, or completely Off-Topic.
+        2. "keep": false if it is a Brand Name, Store, or completely Off-Topic.
         
         Return JSON: {{ "german_word": {{ "en": "english", "keep": true }} }}
         """
         res = run_gemini(api_key, prompt)
         if "error" not in res:
             full_map.update(res)
-        time.sleep(0.2)
+        time.sleep(0.5)
         
     prog_text.empty()
     return full_map
