@@ -7,7 +7,7 @@ import google.generativeai as genai
 from pytrends.request import TrendReq
 import plotly.express as px
 import re
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer
 from sklearn.cluster import AgglomerativeClustering
 import numpy as np
 
@@ -30,41 +30,41 @@ st.markdown("""
     .stTextInput input { background-color: #ffffff !important; border: 1px solid #d0d7de !important; color: #24292e !important; }
     #MainMenu {visibility: hidden;} footer {visibility: hidden;}
     
-    /* Cluster Styling */
     .cluster-box { border: 1px solid #e1e4e8; background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. VECTOR ENGINE (Clustering & Filtering)
+# 2. VECTOR ENGINE (Optimized & Cached)
 # -----------------------------------------------------------------------------
+
 @st.cache_resource(show_spinner=False)
 def load_embedding_model():
-    # Multilingual model is best for German/English comparison
+    """
+    Loads the Multilingual Model (470MB).
+    Cached to run instantly after the first download.
+    """
+    # We use the specific multilingual model required for German-English matching
     return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 
+# Trigger load immediately on app start to unblock UI later
+with st.spinner("Warming up AI Engines (First run takes ~60s)..."):
+    try:
+        _ = load_embedding_model()
+    except Exception as e:
+        st.warning("Model download slow. Please wait...")
+
 def filter_by_semantic_relevance(df_keywords, seed_english, threshold):
-    """
-    Calculates similarity between the English Seed and German Keywords.
-    Drops rows below the threshold.
-    """
     model = load_embedding_model()
+    from sentence_transformers import util
     
-    # 1. Encode Seed (English)
     seed_vec = model.encode(seed_english)
-    
-    # 2. Encode Candidates (German)
     candidate_vecs = model.encode(df_keywords['German Keyword'].tolist())
-    
-    # 3. Calculate Cosine Similarity
     scores = util.cos_sim(seed_vec, candidate_vecs)[0]
     
-    # 4. Assign & Filter
     df_keywords['Relevance Score'] = scores.numpy()
-    
-    # Keep only high relevance
+    # Filter
     df_filtered = df_keywords[df_keywords['Relevance Score'] >= threshold].copy()
-    
     return df_filtered.sort_values('Relevance Score', ascending=False)
 
 def cluster_keywords(df_keywords):
@@ -94,7 +94,7 @@ def cluster_keywords(df_keywords):
     return df_keywords.sort_values('Cluster ID')
 
 # -----------------------------------------------------------------------------
-# 3. GENERATIVE ENGINE
+# 3. GENERATIVE ENGINE (Robust)
 # -----------------------------------------------------------------------------
 
 def run_gemini(api_key, prompt):
@@ -130,7 +130,7 @@ def batch_validate_translate(api_key, keywords, topic):
     
     prog_text = st.empty()
     for i, chunk in enumerate(chunks):
-        prog_text.caption(f"AI analyzing batch {i+1}/{len(chunks)}...")
+        prog_text.caption(f"AI Validating Batch {i+1}/{len(chunks)}...")
         prompt = f"""
         Context Topic: "{topic}"
         Keywords: {json.dumps(chunk)}
@@ -227,14 +227,12 @@ with st.sidebar:
     st.markdown("""<a href="https://aistudio.google.com/app/apikey" target="_blank" style="font-size:0.8rem;color:#0969da;">🔑 Get Free Key</a>""", unsafe_allow_html=True)
     
     st.markdown("---")
-    
-    # SEMANTIC FILTER SLIDER
+    # SLIDER
     relevance_threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.55, 0.05)
     st.markdown(f"""
     <div class="tech-note">
     <b>Semantic Filter ({relevance_threshold}):</b>
-    <br>We calculate the vector distance between your Input Topic and every mined keyword.
-    <br>• Keywords scoring below <b>{relevance_threshold}</b> are automatically discarded as "Topic Drift".
+    <br>Keywords below this similarity score are removed to prevent topic drift.
     </div>
     """, unsafe_allow_html=True)
 
@@ -246,10 +244,6 @@ run_btn = st.button("Generate Strategy", type="primary")
 
 if run_btn and keyword and api_key:
     
-    with st.spinner("Initializing Vector Engine..."):
-        try: _ = load_embedding_model()
-        except: st.stop()
-
     # 1. Strategy
     with st.spinner("Analyzing German Linguistics..."):
         strategy = get_cultural_translation(api_key, keyword)
@@ -266,31 +260,26 @@ if run_btn and keyword and api_key:
     
     if not df.empty:
         # 3. Filter & Translate
-        with st.spinner("Validating & Clustering Keywords..."):
+        with st.spinner("Validating & Clustering..."):
             
-            # --- NEW STEP: SEMANTIC VECTOR FILTERING ---
+            # --- FILTERING ---
             df_filtered = filter_by_semantic_relevance(df, keyword, relevance_threshold)
-            dropped_count = len(df) - len(df_filtered)
             
             if df_filtered.empty:
-                st.error(f"All {len(df)} keywords were below the relevance threshold ({relevance_threshold}). Try lowering the slider.")
+                st.error(f"All keywords filtered. Lower the threshold (current: {relevance_threshold}).")
                 st.stop()
             
-            if dropped_count > 0:
-                st.success(f"Filtered out {dropped_count} irrelevant keywords (Score < {relevance_threshold}). Remaining: {len(df_filtered)}")
+            st.success(f"Kept {len(df_filtered)} relevant keywords (Discarded {len(df)-len(df_filtered)}).")
 
-            # Continue with filtered list
+            # Translate kept keywords
             raw_list = df_filtered['German Keyword'].tolist()
             valid_map = batch_validate_translate(api_key, raw_list, keyword)
             
             df_filtered['English'] = df_filtered['German Keyword'].apply(lambda x: valid_map.get(x, {}).get('en', '-'))
             df_filtered['Keep'] = df_filtered['German Keyword'].apply(lambda x: valid_map.get(x, {}).get('keep', True))
             
+            # Second Filter (Brand check)
             df_clean = df_filtered[df_filtered['Keep'] == True].copy()
-            
-            if df_clean.empty:
-                st.warning("AI filtered out all keywords (Brand/Irrelevant).")
-                df_clean = df_filtered
             
             # 4. CLUSTERING
             df_clustered = cluster_keywords(df_clean)
@@ -304,8 +293,6 @@ if run_btn and keyword and api_key:
         
         with tab_clusters:
             st.markdown("### Content Architecture")
-            st.markdown("We grouped the keywords into semantic clusters. Each cluster represents **One Article**.")
-            
             clusters = df_clustered['Cluster Name'].unique()
             
             for c_name in clusters:
@@ -316,7 +303,6 @@ if run_btn and keyword and api_key:
                     c1, c2 = st.columns([2, 1])
                     with c1:
                         st.dataframe(c_data[['German Keyword', 'English', 'Relevance Score']], use_container_width=True, hide_index=True)
-                    
                     with c2:
                         if st.button(f"✨ Create Brief", key=c_name):
                             with st.spinner("Drafting..."):
