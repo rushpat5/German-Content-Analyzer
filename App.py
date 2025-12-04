@@ -7,13 +7,15 @@ import google.generativeai as genai
 from pytrends.request import TrendReq
 import plotly.express as px
 import re
+from sentence_transformers import SentenceTransformer
 from sklearn.cluster import AgglomerativeClustering
 import numpy as np
+import torch
 
 # -----------------------------------------------------------------------------
-# 1. VISUAL CONFIGURATION
+# 1. VISUAL CONFIGURATION (Dejan Style)
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="German SEO Strategist", layout="wide", page_icon="🇩🇪")
+st.set_page_config(page_title="German SEO Strategist (Gemma)", layout="wide", page_icon="🇩🇪")
 
 st.markdown("""
 <style>
@@ -30,92 +32,67 @@ st.markdown("""
     #MainMenu {visibility: hidden;} footer {visibility: hidden;}
     
     .cluster-box { border: 1px solid #e1e4e8; background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 10px; }
+    .tech-note { font-size: 0.85rem; color: #57606a; background-color: #f6f8fa; border-left: 3px solid #0969da; padding: 12px; border-radius: 0 4px 4px 0; }
 </style>
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. VECTOR ENGINE (Cloud-Based / Lightweight)
+# 2. VECTOR ENGINE (Powered by Google EmbeddingGemma)
 # -----------------------------------------------------------------------------
 
-def get_embeddings_google(text_list, api_key):
+@st.cache_resource(show_spinner=False)
+def load_gemma_model(hf_token):
     """
-    Uses Google's 'text-embedding-004' model via API.
-    Zero RAM usage, instant speed.
+    Loads google/embeddinggemma-300m.
+    Requires HF Token because it is a gated model.
     """
-    genai.configure(api_key=api_key)
-    
-    # Batching (Google accepts up to 100 docs per call usually, we stick to safe batches)
-    # Note: For 'text-embedding-004', content is passed as 'content'
-    embeddings = []
-    
-    # Simple loop to avoid complexity, for SEO lists (usually < 200 items) this is fast enough
-    # Ideally, use batch_embed_contents if lists are huge
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
-        result = genai.embed_content(
-            model="models/text-embedding-004",
-            content=text_list,
-            task_type="clustering",
-        )
-        # The result['embedding'] is a list of vectors
-        return result['embedding']
+        return SentenceTransformer("google/embeddinggemma-300m", token=hf_token).to(device)
     except Exception as e:
-        st.error(f"Embedding Error: {e}")
-        return []
+        st.error(f"Gemma Load Error: {e}. Check HF Token.")
+        return None
 
-def filter_by_semantic_relevance(df_keywords, seed_english, threshold, api_key):
-    # 1. Embed Seed
-    seed_vec = get_embeddings_google([seed_english], api_key)[0]
+def filter_by_semantic_relevance(df_keywords, seed_english, threshold, hf_token):
+    model = load_gemma_model(hf_token)
+    if not model: return df_keywords
     
-    # 2. Embed Candidates
-    candidates = df_keywords['German Keyword'].tolist()
-    # We might need to batch this if > 100 keywords, but for this tool it's okay
-    candidate_vecs = get_embeddings_google(candidates, api_key)
+    from sentence_transformers import util
     
-    if not candidate_vecs: return df_keywords # Fallback if API fails
+    # Gemma requires prompts for optimal performance
+    # We use "STS" (Semantic Textual Similarity) task for comparison
+    seed_vec = model.encode([seed_english], prompt_name="STS", normalize_embeddings=True)
+    candidate_vecs = model.encode(df_keywords['German Keyword'].tolist(), prompt_name="STS", normalize_embeddings=True)
     
-    # 3. Cosine Similarity Manually (No heavy libraries)
-    scores = []
-    seed_norm = np.linalg.norm(seed_vec)
+    scores = util.cos_sim(seed_vec, candidate_vecs)[0]
     
-    for vec in candidate_vecs:
-        vec_norm = np.linalg.norm(vec)
-        if seed_norm == 0 or vec_norm == 0:
-            scores.append(0.0)
-        else:
-            dot_product = np.dot(seed_vec, vec)
-            scores.append(dot_product / (seed_norm * vec_norm))
-            
-    df_keywords['Relevance Score'] = scores
-    
-    # Filter
+    df_keywords['Relevance Score'] = scores.numpy()
     df_filtered = df_keywords[df_keywords['Relevance Score'] >= threshold].copy()
     return df_filtered.sort_values('Relevance Score', ascending=False)
 
-def cluster_keywords(df_keywords, api_key):
+def cluster_keywords(df_keywords, hf_token):
     if len(df_keywords) < 3:
         df_keywords['Cluster'] = "Single Topic"
         return df_keywords
 
-    # Get Vectors via API
-    embeddings = get_embeddings_google(df_keywords['German Keyword'].tolist(), api_key)
+    model = load_gemma_model(hf_token)
+    if not model: return df_keywords
     
-    if not embeddings: return df_keywords
+    # Use "Clustering" prompt for Gemma
+    embeddings = model.encode(df_keywords['German Keyword'].tolist(), prompt_name="Clustering", normalize_embeddings=True)
     
-    # Cluster
     clustering = AgglomerativeClustering(
         n_clusters=None, 
-        distance_threshold=0.8, # Adjusted for Google Embeddings scale
+        distance_threshold=0.9, # Tuned for Gemma's vector space
         metric='euclidean', 
         linkage='ward'
     )
     cluster_ids = clustering.fit_predict(embeddings)
     df_keywords['Cluster ID'] = cluster_ids
     
-    # Name Clusters
     cluster_names = {}
     for cid in np.unique(cluster_ids):
         subset = df_keywords[df_keywords['Cluster ID'] == cid]
-        # Head term is usually the shortest
         head_term = sorted(subset['German Keyword'].tolist(), key=len)[0]
         cluster_names[cid] = head_term.title()
         
@@ -123,7 +100,7 @@ def cluster_keywords(df_keywords, api_key):
     return df_keywords.sort_values('Cluster ID')
 
 # -----------------------------------------------------------------------------
-# 3. GENERATIVE ENGINE (Robust)
+# 3. GENERATIVE ENGINE (Gemini - Brute Force)
 # -----------------------------------------------------------------------------
 
 def run_gemini(api_key, prompt):
@@ -214,7 +191,6 @@ def deep_mine(synonyms):
             prog.progress(min(step/total, 1.0), f"Mining: {seed}{mod}...")
             
             results = fetch_suggestions(f"{seed}{mod}")
-            
             intent = "Informational"
             if "kaufen" in mod: intent = "Transactional"
             elif "gegen" in mod: intent = "Solution"
@@ -252,33 +228,47 @@ def fetch_smart_trends(df_keywords):
 # 5. UI
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### ⚙️ Strategist Config")
+    st.markdown("### ⚙️ Engine Config")
     api_key = st.text_input("Gemini API Key", type="password")
-    st.markdown("""<a href="https://aistudio.google.com/app/apikey" target="_blank" style="font-size:0.8rem;color:#0969da;">🔑 Get Free Key</a>""", unsafe_allow_html=True)
+    hf_token = st.text_input("Hugging Face Token", type="password", help="Required for Google Gemma Model")
+    
+    st.markdown("""
+    <a href="https://aistudio.google.com/app/apikey" target="_blank" style="font-size:0.8rem;color:#0969da;">🔑 Get Gemini Key</a> |
+    <a href="https://huggingface.co/settings/tokens" target="_blank" style="font-size:0.8rem;color:#0969da;">🤗 Get HF Token</a>
+    """, unsafe_allow_html=True)
     
     st.markdown("---")
+    
+    # SLIDER
     relevance_threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.55, 0.05)
     st.markdown(f"""
     <div class="tech-note">
-    <b>Cloud Vector Engine:</b>
-    Using Google's <code>text-embedding-004</code> for instant, lightweight clustering.
+    <b>Gemma-Powered Filter:</b>
+    We use <code>embeddinggemma-300m</code> to calculate semantic distance.
+    <br>• It uses instruction tuning (<i>"task: STS"</i>) to ensure high-quality filtering.
     </div>
     """, unsafe_allow_html=True)
 
 st.title("German SEO Strategist 🇩🇪")
-st.markdown("### Keyword Clustering & Content Architecture")
+st.markdown("### Powered by Google EmbeddingGemma")
 
 keyword = st.text_input("Enter English Topic", placeholder="e.g. newborn babies")
 run_btn = st.button("Generate Strategy", type="primary")
 
-if run_btn and keyword and api_key:
+if run_btn and keyword and api_key and hf_token:
     
+    # Pre-load Gemma
+    with st.spinner("Initializing EmbeddingGemma (300M)..."):
+        try: 
+            _ = load_gemma_model(hf_token)
+        except: st.stop()
+
     # 1. Strategy
     with st.spinner("Analyzing German Linguistics..."):
         strategy = get_cultural_translation(api_key, keyword)
     
     if not strategy or "error" in strategy:
-        st.error(f"AI Error: {strategy.get('error') if strategy else 'Unknown'}")
+        st.error("AI Error.")
         st.stop()
 
     synonyms = strategy.get('synonyms', [])
@@ -289,19 +279,19 @@ if run_btn and keyword and api_key:
     
     if not df.empty:
         # 3. Filter & Translate
-        with st.spinner("Validating & Clustering Keywords (Cloud Mode)..."):
+        with st.spinner("Validating & Clustering..."):
             
-            # --- CLOUD SEMANTIC FILTERING ---
-            df_filtered = filter_by_semantic_relevance(df, keyword, relevance_threshold, api_key)
+            # --- GEMMA VECTOR FILTERING ---
+            df_filtered = filter_by_semantic_relevance(df, keyword, relevance_threshold, hf_token)
             
             dropped_count = len(df) - len(df_filtered)
             if df_filtered.empty:
-                st.error(f"All keywords filtered. Try lowering the threshold.")
+                st.error(f"All keywords filtered by Gemma. Try lowering the threshold.")
                 st.stop()
             
-            st.success(f"Kept {len(df_filtered)} relevant keywords (Discarded {dropped_count}).")
+            st.success(f"Gemma filtered out {dropped_count} irrelevant keywords.")
 
-            # Translate kept keywords
+            # Translate
             raw_list = df_filtered['German Keyword'].tolist()
             valid_map = batch_validate_translate(api_key, raw_list, keyword)
             
@@ -310,12 +300,8 @@ if run_btn and keyword and api_key:
             
             df_clean = df_filtered[df_filtered['Keep'] == True].copy()
             
-            if df_clean.empty:
-                st.warning("AI filtered out all keywords (Brand/Irrelevant).")
-                df_clean = df_filtered
-            
-            # 4. CLUSTERING (Via Cloud Embeddings)
-            df_clustered = cluster_keywords(df_clean, api_key)
+            # 4. CLUSTERING (With Gemma)
+            df_clustered = cluster_keywords(df_clean, hf_token)
             
             # 5. Trends
             trends = fetch_smart_trends(df_clustered)
@@ -347,15 +333,15 @@ if run_btn and keyword and api_key:
                                     for sec in brief.get('outline', []):
                                         st.markdown(f"- **{sec.get('h2')}**")
                                 else:
-                                    st.error("Brief generation failed.")
+                                    st.error("Failed.")
         
         with tab_data:
             st.dataframe(df_clustered, use_container_width=True)
             csv = df_clustered.to_csv(index=False).encode('utf-8')
-            st.download_button("Download Strategy CSV", csv, "german_clusters.csv", "text/csv")
+            st.download_button("Download CSV", csv, "german_gemma_clusters.csv", "text/csv")
             
     else:
         st.warning("No keywords found.")
 
 elif run_btn:
-    st.error("API Key required.")
+    st.error("API Key and HF Token required.")
