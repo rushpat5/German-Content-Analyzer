@@ -85,8 +85,8 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     df_relevant = df_keywords[df_keywords['Relevance'] >= threshold].copy()
     
     # --- B. SPLITTING ---
-    df_direct = df_relevant[df_relevant['Relevance'] > 0.82].copy()
-    df_clusters = df_relevant[df_relevant['Relevance'] <= 0.82].copy()
+    df_direct = df_relevant[df_relevant['Relevance'] > 0.65].copy()
+    df_clusters = df_relevant[df_relevant['Relevance'] <= 0.65].copy()
     
     # --- C. CLUSTERING ---
     if len(df_clusters) > 2:
@@ -363,3 +363,4 @@ if st.session_state.data_processed:
 
 elif not st.session_state.data_processed and run_btn:
     st.error("Please provide API Keys.")
+
