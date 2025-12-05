@@ -3,6 +3,7 @@ pandas
 requests
 plotly
 google-generativeai
-sentence-transformers>=3.0.0
+pytrends
+sentence-transformers
 scikit-learn
 torch
