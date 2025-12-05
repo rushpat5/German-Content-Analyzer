@@ -246,7 +246,7 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-st.title("German Vector Strategist 🇩🇪")
+st.title("Rank in Germany 🇩🇪")
 st.markdown("### Find, Cluster, and Plan German Keywords")
 
 keyword = st.text_input("Enter English Topic", placeholder="e.g. newborn babies")
@@ -363,5 +363,6 @@ if st.session_state.data_processed:
 
 elif not st.session_state.data_processed and run_btn:
     st.error("Please provide API Keys.")
+
 
 
