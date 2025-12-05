@@ -186,7 +186,7 @@ def fetch_suggestions(query):
 def deep_mine(synonyms):
     modifiers = ["", " für", " bei", " gegen", " was", " wann", " hausmittel", " kaufen"]
     all_data = []
-    prog = st.progress(0, "Mining Google Germany...")
+    prog = st.progress(0, "Mining...")
     total = len(synonyms) * len(modifiers)
     step = 0
     for seed in synonyms:
@@ -251,7 +251,9 @@ if run_btn and keyword and api_key:
     # 1. Strategy
     with st.spinner("Linguistic Analysis (Gemini)..."):
         strategy = get_cultural_translation(api_key, keyword)
-        if not strategy or "error" in strategy: st.error("AI Error."); st.stop()
+        if not strategy or "error" in strategy:
+            st.error(f"AI Error: {strategy.get('error') if strategy else 'Unknown'}")
+            st.stop()
         st.session_state.synonyms = strategy.get('synonyms', [])
         st.session_state.strategy_text = strategy.get('explanation', '')
 
@@ -259,9 +261,13 @@ if run_btn and keyword and api_key:
     df = deep_mine(st.session_state.synonyms)
     
     if not df.empty:
-        # 3. Filter & Cluster (Using RoBERTa)
+        # 3. Filter & Cluster (Using Vector Model)
         with st.spinner("Vector Filtering & Clustering..."):
             df_direct, df_clustered = process_keywords_vector(df, st.session_state.synonyms, threshold)
+            
+            if df_direct is None: # Safety check if model failed
+                st.error("Vector Model Failed.")
+                st.stop()
             
         # 4. Translate
         with st.spinner("Translating..."):
