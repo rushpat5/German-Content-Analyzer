@@ -48,18 +48,18 @@ if 'data_processed' not in st.session_state:
     st.session_state.briefs = {} 
 
 # -----------------------------------------------------------------------------
-# 3. VECTOR ENGINE (German RoBERTa)
+# 3. VECTOR ENGINE (Stable MPNet)
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_german_model():
     """
-    Loads T-Systems-onsite/german-roberta-sentence-transformer-v2.
-    Specialized for German compound splitting and semantic matching.
-    MIT License (No Token Required).
+    Loads 'paraphrase-multilingual-mpnet-base-v2'.
+    High Stability, Great German performance.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
-        return SentenceTransformer("T-Systems-onsite/german-roberta-sentence-transformer-v2").to(device)
+        # Using the robust official SBERT model to avoid 'NoneType' config errors
+        return SentenceTransformer("sentence-transformers/paraphrase-multilingual-mpnet-base-v2").to(device)
     except Exception as e:
         st.error(f"Model Load Error: {e}")
         return None
@@ -69,23 +69,20 @@ def process_keywords_vector(df_keywords, seeds, threshold):
     if not model: return None, None
     
     # --- A. SCORING (DE Seeds vs DE Keywords) ---
-    # RoBERTa does not need "prompts", just raw text
     seed_vecs = model.encode(seeds, normalize_embeddings=True)
     candidates = df_keywords['German Keyword'].tolist()
     candidate_vecs = model.encode(candidates, normalize_embeddings=True)
     
     # Calculate Cosine Similarity
     scores_matrix = util.cos_sim(candidate_vecs, seed_vecs)
-    # Take the best match score against any of the 3 seeds
     max_scores, _ = torch.max(scores_matrix, dim=1)
     
     df_keywords['Relevance'] = max_scores.numpy()
     
-    # Filter noise (Threshold)
+    # Filter noise
     df_relevant = df_keywords[df_keywords['Relevance'] >= threshold].copy()
     
     # --- B. SPLITTING ---
-    # > 0.85 usually means it's a grammatical variation of the seed
     df_direct = df_relevant[df_relevant['Relevance'] > 0.85].copy()
     df_clusters = df_relevant[df_relevant['Relevance'] <= 0.85].copy()
     
@@ -93,17 +90,15 @@ def process_keywords_vector(df_keywords, seeds, threshold):
     if len(df_clusters) > 2:
         cluster_vecs = model.encode(df_clusters['German Keyword'].tolist(), normalize_embeddings=True)
         
-        # Agglomerative Clustering works best for semantic grouping
         clustering = AgglomerativeClustering(
             n_clusters=None, 
-            distance_threshold=1.2, # Adjusted for RoBERTa's vector space
+            distance_threshold=1.2, 
             metric='euclidean', 
             linkage='ward'
         )
         cluster_ids = clustering.fit_predict(cluster_vecs)
         df_clusters['Cluster ID'] = cluster_ids
         
-        # Name clusters by shortest keyword (Head Term)
         cluster_names = {}
         for cid in np.unique(cluster_ids):
             subset = df_clusters[df_clusters['Cluster ID'] == cid]
@@ -228,8 +223,10 @@ with st.sidebar:
     
     st.markdown("""
     <div class="tech-note">
-    <b>German RoBERTa Engine:</b>
-    We use <code>T-Systems/german-roberta</code> for superior handling of compound nouns (e.g. <i>Schwangerschaftsabbruch</i>) compared to standard English models.
+    <b>MPNet-Multilingual Engine:</b>
+    Using <code>paraphrase-multilingual-mpnet-base-v2</code>.
+    <br>• The highest-performing open model for semantic matching across languages.
+    <br>• Stability: Excellent.
     </div>
     """, unsafe_allow_html=True)
 
@@ -244,7 +241,7 @@ if run_btn and keyword and api_key:
     st.session_state.briefs = {}
 
     # 0. Load Model (Cached)
-    with st.spinner("Initializing German RoBERTa Model..."):
+    with st.spinner("Initializing Multilingual MPNet Model..."):
         try: _ = load_german_model()
         except: st.stop()
 
