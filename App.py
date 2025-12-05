@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 # -----------------------------------------------------------------------------
-# 1. VISUAL CONFIGURATION
+# 1. VISUAL CONFIGURATION (Strict Dejan Style)
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="German SEO Planner", layout="wide", page_icon="🇩🇪")
 
@@ -37,7 +37,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. SESSION STATE
+# 2. SESSION STATE INITIALIZATION
 # -----------------------------------------------------------------------------
 if 'data_processed' not in st.session_state:
     st.session_state.data_processed = False
@@ -48,13 +48,13 @@ if 'data_processed' not in st.session_state:
     st.session_state.briefs = {} 
 
 # -----------------------------------------------------------------------------
-# 3. VECTOR ENGINE (EmbeddingGemma)
+# 3. VECTOR ENGINE (EmbeddingGemma - Fixed Auth)
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_gemma_model(hf_token):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
-        # Using use_auth_token for compatibility
+        # Using 'use_auth_token' for compatibility
         return SentenceTransformer("google/embeddinggemma-300m", use_auth_token=hf_token).to(device)
     except Exception as e:
         st.error(f"Gemma Load Error: {e}")
@@ -82,9 +82,9 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     # Filter noise
     df_relevant = df_keywords[df_keywords['Relevance'] >= threshold].copy()
     
-    # --- B. SPLITTING ---
-    df_direct = df_relevant[df_relevant['Relevance'] > 0.82].copy()
-    df_clusters = df_relevant[df_relevant['Relevance'] <= 0.82].copy()
+    # --- B. SPLITTING (Adjusted Threshold to 0.65) ---
+    df_direct = df_relevant[df_relevant['Relevance'] > 0.65].copy()
+    df_clusters = df_relevant[df_relevant['Relevance'] <= 0.65].copy()
     
     # --- C. CLUSTERING ---
     if len(df_clusters) > 2:
@@ -111,40 +111,17 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     return df_direct.sort_values('Relevance', ascending=False), df_clusters.sort_values('Cluster ID')
 
 # -----------------------------------------------------------------------------
-# 4. GENERATIVE ENGINE (Dynamic Discovery Fix)
+# 4. GENERATIVE ENGINE
 # -----------------------------------------------------------------------------
-
-def get_working_model_name(api_key):
-    """
-    Connects to Google and finds the exact model name available to this key.
-    """
+def run_gemini(api_key, prompt):
     genai.configure(api_key=api_key)
     try:
-        all_models = list(genai.list_models())
-        # Filter for text generation models
-        valid_models = [m.name for m in all_models if 'generateContent' in m.supported_generation_methods]
+        models = list(genai.list_models())
+        valid = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+        # Priority: Flash -> Pro
+        chosen = next((m for m in valid if 'flash' in m), next((m for m in valid if 'pro' in m), "models/gemini-1.5-flash"))
         
-        if not valid_models:
-            # Fallback if list is empty but auth worked
-            return "models/gemini-1.5-flash"
-            
-        # Priority Logic
-        for m in valid_models:
-            if 'flash' in m.lower() and '1.5' in m: return m
-        for m in valid_models:
-            if 'pro' in m.lower() and '1.5' in m: return m
-            
-        return valid_models[0] # Ultimate fallback
-    except:
-        return "models/gemini-1.5-flash"
-
-def run_gemini(api_key, prompt):
-    try:
-        # 1. Find Model
-        model_name = get_working_model_name(api_key)
-        model = genai.GenerativeModel(model_name)
-        
-        # 2. Generate
+        model = genai.GenerativeModel(chosen)
         response = model.generate_content(prompt)
         text = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
@@ -154,11 +131,14 @@ def run_gemini(api_key, prompt):
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
-    Act as a Native German SEO. English Keyword: "{keyword}"
-    Identify 3 distinct German terms:
-    1. Colloquial (Most common).
-    2. Formal/Medical.
-    3. Synonym.
+    Act as a Native German SEO Expert.
+    English Keyword: "{keyword}"
+    
+    Task: Identify the top 3 distinct German terms used for this concept. 
+    1. The most common colloquial term.
+    2. The formal/medical term.
+    3. A popular synonym.
+    
     Return JSON: {{ "synonyms": ["term1", "term2", "term3"], "explanation": "Reasoning" }}
     """
     return run_gemini(api_key, prompt)
@@ -206,13 +186,23 @@ def deep_mine(synonyms):
     prog = st.progress(0, "Mining...")
     total = len(synonyms) * len(modifiers)
     step = 0
+    
     for seed in synonyms:
         for mod in modifiers:
             step += 1; prog.progress(min(step/total, 1.0), f"Mining: {seed}{mod}...")
             results = fetch_suggestions(f"{seed}{mod}")
+            
+            # --- INTENT LOGIC ADDED ---
+            intent = "Informational"
+            if "kaufen" in mod: intent = "Transactional"
+            elif "gegen" in mod: intent = "Solution"
+            elif "hausmittel" in mod: intent = "DIY/Remedy"
+            # ---------------------------
+            
             for r in results:
-                all_data.append({"German Keyword": r, "Seed": seed})
+                all_data.append({"German Keyword": r, "Seed": seed, "Intent": intent})
             time.sleep(0.05)
+            
     prog.empty()
     df = pd.DataFrame(all_data)
     if not df.empty: return df.drop_duplicates(subset=['German Keyword'])
@@ -238,17 +228,21 @@ def fetch_smart_trends(df_keywords):
 with st.sidebar:
     st.markdown("### ⚙️ Engine Config")
     api_key = st.text_input("Gemini API Key", type="password")
-    hf_token = st.text_input("Hugging Face Token", type="password")
+    hf_token = st.text_input("Hugging Face Token", type="password", help="Required for Google Gemma")
+    
     st.markdown("""
     <a href="https://aistudio.google.com/app/apikey" target="_blank" style="font-size:0.8rem;">🔑 Gemini Key</a> | 
     <a href="https://huggingface.co/settings/tokens" target="_blank" style="font-size:0.8rem;">🤗 HF Token</a>
     """, unsafe_allow_html=True)
+    
     st.markdown("---")
     threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.50, 0.05)
-    st.markdown(f"""
+    
+    st.markdown("""
     <div class="tech-note">
     <b>Gemma-Powered Filter:</b>
-    Using <code>embeddinggemma-300m</code> to calculate semantic distance.
+    We use <code>embeddinggemma-300m</code> to calculate semantic distance.
+    <br>• It uses instruction tuning (<i>"task: STS"</i>) to ensure high-quality filtering.
     </div>
     """, unsafe_allow_html=True)
 
@@ -262,19 +256,17 @@ if run_btn and keyword and api_key and hf_token:
     st.session_state.data_processed = False
     st.session_state.briefs = {}
 
-    # 0. Load Model
-    with st.spinner("Loading EmbeddingGemma..."):
+    # 0. Load Model (Cached)
+    with st.spinner("Initializing Google Gemma Model (300M)..."):
         try: _ = load_gemma_model(hf_token)
         except: st.stop()
 
     # 1. Strategy
     with st.spinner("Linguistic Analysis (Gemini)..."):
         strategy = get_cultural_translation(api_key, keyword)
-        
         if not strategy or "error" in strategy:
-            st.error(f"AI Error: {strategy.get('error') if strategy else 'Unknown Error'}")
+            st.error(f"AI Error: {strategy.get('error') if strategy else 'Unknown'}")
             st.stop()
-        
         st.session_state.synonyms = strategy.get('synonyms', [])
         st.session_state.strategy_text = strategy.get('explanation', '')
 
@@ -282,8 +274,9 @@ if run_btn and keyword and api_key and hf_token:
     df = deep_mine(st.session_state.synonyms)
     
     if not df.empty:
-        # 3. Filter & Cluster
+        # 3. Filter & Cluster (Using Vector Model)
         with st.spinner("Vector Filtering & Clustering..."):
+            # Pass HF Token to process function
             df_direct, df_clustered = process_keywords_gemma(df, st.session_state.synonyms, threshold, hf_token)
             
             if df_direct is None: 
