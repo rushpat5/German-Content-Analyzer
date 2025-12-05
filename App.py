@@ -15,7 +15,7 @@ import torch
 # -----------------------------------------------------------------------------
 # 1. VISUAL CONFIGURATION (Strict Dejan Style)
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="German SEO Strategist", layout="wide", page_icon="🇩🇪")
+st.set_page_config(page_title="Rank in Germany", layout="wide", page_icon="🇩🇪")
 
 st.markdown("""
 <style>
@@ -247,7 +247,7 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
 st.title("German Vector Strategist 🇩🇪")
-st.markdown("### Cross-Border Intelligence Powered by EmbeddingGemma")
+st.markdown("### Find, Cluster, and Plan German Keywords")
 
 keyword = st.text_input("Enter English Topic", placeholder="e.g. newborn babies")
 run_btn = st.button("Generate Strategy", type="primary")
@@ -363,4 +363,5 @@ if st.session_state.data_processed:
 
 elif not st.session_state.data_processed and run_btn:
     st.error("Please provide API Keys.")
+
 
