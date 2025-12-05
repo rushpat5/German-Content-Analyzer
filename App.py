@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 # -----------------------------------------------------------------------------
-# 1. VISUAL CONFIGURATION
+# 1. VISUAL CONFIGURATION (Strict Dejan Style)
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="German SEO Planner", layout="wide", page_icon="🇩🇪")
 
@@ -48,51 +48,61 @@ if 'data_processed' not in st.session_state:
     st.session_state.briefs = {} 
 
 # -----------------------------------------------------------------------------
-# 3. VECTOR ENGINE (Stable MPNet)
+# 3. VECTOR ENGINE (Google EmbeddingGemma)
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
-def load_german_model():
+def load_gemma_model(hf_token):
     """
-    Loads 'paraphrase-multilingual-mpnet-base-v2'.
-    High Stability, Great German performance.
+    Loads google/embeddinggemma-300m.
+    This requires a valid HF Token.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
-        # Using the robust official SBERT model to avoid 'NoneType' config errors
-        return SentenceTransformer("sentence-transformers/paraphrase-multilingual-mpnet-base-v2").to(device)
+        # FIX: Using use_auth_token for stability
+        return SentenceTransformer("google/embeddinggemma-300m", use_auth_token=hf_token).to(device)
     except Exception as e:
-        st.error(f"Model Load Error: {e}")
+        st.error(f"Gemma Load Error: {e}")
         return None
 
-def process_keywords_vector(df_keywords, seeds, threshold):
-    model = load_german_model()
+def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
+    model = load_gemma_model(hf_token)
     if not model: return None, None
     
-    # --- A. SCORING (DE Seeds vs DE Keywords) ---
-    seed_vecs = model.encode(seeds, normalize_embeddings=True)
-    candidates = df_keywords['German Keyword'].tolist()
-    candidate_vecs = model.encode(candidates, normalize_embeddings=True)
+    # --- A. SCORING (Instruction-Tuned) ---
+    # We use the "STS" (Semantic Textual Similarity) instruction for scoring
+    try:
+        seed_vecs = model.encode(seeds, prompt_name="STS", normalize_embeddings=True)
+        candidates = df_keywords['German Keyword'].tolist()
+        candidate_vecs = model.encode(candidates, prompt_name="STS", normalize_embeddings=True)
+    except TypeError:
+        # Fallback if prompt_name is not supported by installed library version
+        seed_vecs = model.encode(seeds, normalize_embeddings=True)
+        candidates = df_keywords['German Keyword'].tolist()
+        candidate_vecs = model.encode(candidates, normalize_embeddings=True)
     
-    # Calculate Cosine Similarity
     scores_matrix = util.cos_sim(candidate_vecs, seed_vecs)
     max_scores, _ = torch.max(scores_matrix, dim=1)
     
     df_keywords['Relevance'] = max_scores.numpy()
     
-    # Filter noise
+    # Filter
     df_relevant = df_keywords[df_keywords['Relevance'] >= threshold].copy()
     
     # --- B. SPLITTING ---
-    df_direct = df_relevant[df_relevant['Relevance'] > 0.85].copy()
-    df_clusters = df_relevant[df_relevant['Relevance'] <= 0.85].copy()
+    df_direct = df_relevant[df_relevant['Relevance'] > 0.82].copy()
+    df_clusters = df_relevant[df_relevant['Relevance'] <= 0.82].copy()
     
     # --- C. CLUSTERING ---
     if len(df_clusters) > 2:
-        cluster_vecs = model.encode(df_clusters['German Keyword'].tolist(), normalize_embeddings=True)
-        
+        # Use "Clustering" instruction if available
+        try:
+            cluster_vecs = model.encode(df_clusters['German Keyword'].tolist(), prompt_name="Clustering", normalize_embeddings=True)
+        except:
+            cluster_vecs = model.encode(df_clusters['German Keyword'].tolist(), normalize_embeddings=True)
+            
         clustering = AgglomerativeClustering(
             n_clusters=None, 
-            distance_threshold=1.2, 
+            distance_threshold=0.85, # Tuned for Gemma
             metric='euclidean', 
             linkage='ward'
         )
@@ -116,23 +126,23 @@ def process_keywords_vector(df_keywords, seeds, threshold):
 # -----------------------------------------------------------------------------
 def run_gemini(api_key, prompt):
     genai.configure(api_key=api_key)
-    try:
-        # Dynamic Model Selection
-        models = list(genai.list_models())
-        valid = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        chosen = next((m for m in valid if 'flash' in m), next((m for m in valid if 'pro' in m), "models/gemini-1.5-flash"))
-        
-        model = genai.GenerativeModel(chosen)
-        response = model.generate_content(prompt)
-        text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
-    except Exception as e:
-        if "429" in str(e): time.sleep(1); return run_gemini(api_key, prompt)
-        return {"error": str(e)}
+    candidates = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+    last_err = ""
+    for model_name in candidates:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            text = response.text.replace("```json", "").replace("```", "").strip()
+            return json.loads(text)
+        except Exception as e:
+            last_err = str(e)
+            if "429" in str(e): time.sleep(1)
+            continue
+    return {"error": f"AI Failed: {last_err}"}
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
-    Act as a Native German SEO. English Keyword: "{keyword}"
+    Act as a Native German SEO Expert. English Keyword: "{keyword}"
     Identify 3 distinct German terms:
     1. Colloquial (Most common).
     2. Formal/Medical.
@@ -216,17 +226,20 @@ def fetch_smart_trends(df_keywords):
 with st.sidebar:
     st.markdown("### ⚙️ Engine Config")
     api_key = st.text_input("Gemini API Key", type="password")
-    st.markdown("""<a href="https://aistudio.google.com/app/apikey" target="_blank" style="font-size:0.8rem;color:#0969da;">🔑 Get Free Key</a>""", unsafe_allow_html=True)
+    hf_token = st.text_input("Hugging Face Token", type="password", help="Required for Google Gemma")
+    
+    st.markdown("""
+    <a href="https://aistudio.google.com/app/apikey" target="_blank" style="font-size:0.8rem;color:#0969da;">🔑 Get Gemini Key</a> | 
+    <a href="https://huggingface.co/settings/tokens" target="_blank" style="font-size:0.8rem;color:#0969da;">🤗 Get HF Token</a>
+    """, unsafe_allow_html=True)
     
     st.markdown("---")
-    threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.55, 0.05)
+    threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.50, 0.05)
     
     st.markdown("""
     <div class="tech-note">
-    <b>MPNet-Multilingual Engine:</b>
-    Using <code>paraphrase-multilingual-mpnet-base-v2</code>.
-    <br>• The highest-performing open model for semantic matching across languages.
-    <br>• Stability: Excellent.
+    <b>Powered by Google EmbeddingGemma:</b>
+    This tool uses Google's own open-weight model. It calculates semantic distance using the same Transformer architecture as Google's internal systems, ensuring maximum alignment with search intent.
     </div>
     """, unsafe_allow_html=True)
 
@@ -236,13 +249,13 @@ st.markdown("### Turn English Topics into German Content Strategies")
 keyword = st.text_input("Enter English Topic", placeholder="e.g. newborn babies")
 run_btn = st.button("Generate Strategy", type="primary")
 
-if run_btn and keyword and api_key:
+if run_btn and keyword and api_key and hf_token:
     st.session_state.data_processed = False
     st.session_state.briefs = {}
 
     # 0. Load Model (Cached)
-    with st.spinner("Initializing Multilingual MPNet Model..."):
-        try: _ = load_german_model()
+    with st.spinner("Initializing Google Gemma Model (300M)..."):
+        try: _ = load_gemma_model(hf_token)
         except: st.stop()
 
     # 1. Strategy
@@ -260,10 +273,10 @@ if run_btn and keyword and api_key:
     if not df.empty:
         # 3. Filter & Cluster (Using Vector Model)
         with st.spinner("Vector Filtering & Clustering..."):
-            df_direct, df_clustered = process_keywords_vector(df, st.session_state.synonyms, threshold)
+            # Pass HF Token to process function
+            df_direct, df_clustered = process_keywords_gemma(df, st.session_state.synonyms, threshold, hf_token)
             
-            if df_direct is None: # Safety check if model failed
-                st.error("Vector Model Failed.")
+            if df_direct is None: 
                 st.stop()
             
         # 4. Translate
@@ -352,4 +365,4 @@ if st.session_state.data_processed:
         st.download_button("📥 Download CSV", csv, "german_strategy.csv", "text/csv")
 
 elif not st.session_state.data_processed and run_btn:
-    st.error("Please provide API Key.")
+    st.error("Please provide API Keys.")
