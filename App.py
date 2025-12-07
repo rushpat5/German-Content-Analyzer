@@ -114,47 +114,53 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     return df_direct.sort_values('Relevance', ascending=False), df_clusters.sort_values('Cluster ID')
 
 # -----------------------------------------------------------------------------
-# 4. GENERATIVE ENGINE (FIXED: Dynamic Model Finder + Loop Protection)
+# 4. GENERATIVE ENGINE (FINAL FIX: Cascade Strategy + Rate Limit Handling)
 # -----------------------------------------------------------------------------
 def run_gemini(api_key, prompt, retries=0):
-    # 1. Stop infinite loops if quota is hit
+    # 1. Stop if we've retried too many times (prevents infinite loops)
     if retries > 3:
-        return {"error": "Max retries exceeded (API Quota or Network Issue)"}
-        
+        return {"error": "⚠️ API Rate Limit Hit (429). Please wait a minute or check your API key quota."}
+
     genai.configure(api_key=api_key)
     
-    try:
-        # 2. Dynamically find the best available model (Fixes 404 Error)
-        # We list models your API key actually has access to.
-        available_models = list(genai.list_models())
-        valid_models = [m.name for m in available_models if 'generateContent' in m.supported_generation_methods]
-        
-        # Priority: Flash -> 1.5 -> Pro -> First Available
-        chosen_model = next((m for m in valid_models if 'flash' in m), 
-                       next((m for m in valid_models if 'gemini-1.5' in m),
-                       next((m for m in valid_models if 'pro' in m), 
-                       valid_models[0] if valid_models else "models/gemini-pro")))
-        
-        model = genai.GenerativeModel(chosen_model)
-        response = model.generate_content(prompt)
-        
-        # 3. Clean JSON Cleanly
-        text = response.text
-        text = re.sub(r"```json", "", text)
-        text = re.sub(r"```", "", text)
-        text = text.strip()
-        
-        return json.loads(text)
+    # 2. MODEL LIST: Try these in order. If one fails (404), we try the next.
+    # 'gemini-1.5-flash' is fastest. 'gemini-pro' is the most compatible fallback.
+    candidates = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+    
+    last_error = None
 
-    except Exception as e:
-        error_msg = str(e)
-        # Handle Quota limits (429) gracefully
-        if "429" in error_msg: 
-            time.sleep(2) # Wait longer
-            return run_gemini(api_key, prompt, retries=retries+1)
-        
-        # Handle Model Not Found or other API errors
-        return {"error": f"Gemini Error ({type(e).__name__}): {error_msg}"}
+    for model_name in candidates:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            
+            # 3. Parse JSON cleanly
+            text = response.text
+            # Remove Markdown formatting if present
+            text = re.sub(r"```json", "", text)
+            text = re.sub(r"```", "", text)
+            text = text.strip()
+            
+            return json.loads(text)
+
+        except Exception as e:
+            last_error = str(e)
+            
+            # CASE A: RATE LIMIT (429) -> Wait and Retry the whole function
+            if "429" in last_error:
+                time.sleep(2 * (retries + 1)) # Exponential Backoff: 2s, 4s, 6s...
+                return run_gemini(api_key, prompt, retries=retries+1)
+            
+            # CASE B: MODEL NOT FOUND (404) -> Continue to next model in loop
+            if "404" in last_error or "not found" in last_error.lower():
+                continue 
+            
+            # CASE C: INVALID KEY / AUTH ERROR -> Return error immediately (don't retry)
+            if "400" in last_error or "403" in last_error:
+                return {"error": f"API Key Error: {last_error}"}
+
+    # If we tried all models and they all failed
+    return {"error": f"All AI models failed. Last error: {last_error}"}
         
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
@@ -412,4 +418,5 @@ if st.session_state.data_processed:
 
 elif not st.session_state.data_processed and run_btn:
     st.error("Please provide API Keys.")
+
 
