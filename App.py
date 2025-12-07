@@ -114,32 +114,48 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     return df_direct.sort_values('Relevance', ascending=False), df_clusters.sort_values('Cluster ID')
 
 # -----------------------------------------------------------------------------
-# 4. GENERATIVE ENGINE (FIXED LOOP)
+# 4. GENERATIVE ENGINE (FIXED: Dynamic Model Finder + Loop Protection)
 # -----------------------------------------------------------------------------
 def run_gemini(api_key, prompt, retries=0):
+    # 1. Stop infinite loops if quota is hit
     if retries > 3:
-        return {"error": "Max retries exceeded (API Quota or 429 Error)"}
+        return {"error": "Max retries exceeded (API Quota or Network Issue)"}
         
     genai.configure(api_key=api_key)
+    
     try:
-        # Skip listing models (it's slow), default to Flash 
-        model = genai.GenerativeModel("models/gemini-1.5-flash")
+        # 2. Dynamically find the best available model (Fixes 404 Error)
+        # We list models your API key actually has access to.
+        available_models = list(genai.list_models())
+        valid_models = [m.name for m in available_models if 'generateContent' in m.supported_generation_methods]
+        
+        # Priority: Flash -> 1.5 -> Pro -> First Available
+        chosen_model = next((m for m in valid_models if 'flash' in m), 
+                       next((m for m in valid_models if 'gemini-1.5' in m),
+                       next((m for m in valid_models if 'pro' in m), 
+                       valid_models[0] if valid_models else "models/gemini-pro")))
+        
+        model = genai.GenerativeModel(chosen_model)
         response = model.generate_content(prompt)
         
-        # Clean JSON string
+        # 3. Clean JSON Cleanly
         text = response.text
         text = re.sub(r"```json", "", text)
         text = re.sub(r"```", "", text)
         text = text.strip()
         
         return json.loads(text)
-    except Exception as e:
-        error_str = str(e)
-        if "429" in error_str: 
-            time.sleep(2)
-            return run_gemini(api_key, prompt, retries=retries+1)
-        return {"error": error_str}
 
+    except Exception as e:
+        error_msg = str(e)
+        # Handle Quota limits (429) gracefully
+        if "429" in error_msg: 
+            time.sleep(2) # Wait longer
+            return run_gemini(api_key, prompt, retries=retries+1)
+        
+        # Handle Model Not Found or other API errors
+        return {"error": f"Gemini Error ({type(e).__name__}): {error_msg}"}
+        
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
     Act as a Native German SEO Expert.
@@ -396,3 +412,4 @@ if st.session_state.data_processed:
 
 elif not st.session_state.data_processed and run_btn:
     st.error("Please provide API Keys.")
+
