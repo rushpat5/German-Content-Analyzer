@@ -11,7 +11,7 @@ import torch
 # -----------------------------------------------------------------------------
 # 1. VISUAL CONFIGURATION
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="German SEO Planner (Lite)", layout="wide", page_icon="🇩🇪")
+st.set_page_config(page_title="German SEO Planner (Stable)", layout="wide", page_icon="🇩🇪")
 
 st.markdown("""
 <style>
@@ -25,13 +25,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. SESSION STATE
+# 2. SESSION STATE & MODEL MEMORY
 # -----------------------------------------------------------------------------
 if 'data_processed' not in st.session_state:
     st.session_state.data_processed = False
     st.session_state.df_results = None
     st.session_state.synonyms = []
     st.session_state.strategy_text = ""
+    # This stores the working model name so we don't guess every time
+    st.session_state.working_model_name = None 
 
 # -----------------------------------------------------------------------------
 # 3. VECTOR ENGINE (Lightweight)
@@ -64,35 +66,58 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     return df_keywords[df_keywords['Relevance'] >= threshold].sort_values('Relevance', ascending=False)
 
 # -----------------------------------------------------------------------------
-# 4. GENERATIVE ENGINE (NUCLEAR FIX: SINGLE MODEL, CLEAN NAME)
+# 4. GENERATIVE ENGINE (SELF-HEALING)
 # -----------------------------------------------------------------------------
 def run_gemini(api_key, prompt):
     genai.configure(api_key=api_key)
     
-    # 1. USE CLEAN NAME (No 'models/' prefix to avoid 404s)
-    # 2. USE ONLY ONE MODEL (To avoid rate limit loops)
-    model_name = "gemini-1.5-flash"
+    # 1. If we already found a working model, use it directly.
+    if st.session_state.working_model_name:
+        candidates = [st.session_state.working_model_name]
+    else:
+        # 2. If not, try these in order until one works
+        candidates = [
+            "gemini-1.5-flash",       # Latest fast model
+            "gemini-1.5-pro",         # Latest robust model
+            "gemini-pro",             # Legacy model (Most compatible)
+            "models/gemini-1.5-flash" # Alternative naming
+        ]
     
-    try:
-        model = genai.GenerativeModel(model_name)
-        # Set a shorter timeout so it doesn't hang
-        response = model.generate_content(prompt, request_options={"timeout": 30})
-        
-        text = re.sub(r"```json|```", "", response.text).strip()
-        return json.loads(text)
+    last_error = None
 
-    except Exception as e:
-        error_msg = str(e)
-        
-        # Friendly Error Handling
-        if "429" in error_msg:
-            return {"error": "⏳ Too Many Requests. Google is limiting your free key. Please wait 60 seconds."}
-        if "404" in error_msg:
-            return {"error": f"❌ Model Not Found ({model_name}). This usually means your API Key does not support 1.5 Flash yet, or the library version is old."}
-        if "API key" in error_msg or "403" in error_msg:
-            return {"error": "🔑 Invalid API Key. Check your Google AI Studio key."}
+    for model_name in candidates:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
             
-        return {"error": f"System Error: {error_msg}"}
+            # Clean response
+            text = re.sub(r"```json|```", "", response.text).strip()
+            
+            # SUCCESS! Save this model name for future calls
+            st.session_state.working_model_name = model_name
+            
+            return json.loads(text)
+
+        except Exception as e:
+            last_error = str(e)
+            
+            # If Rate Limit (429), wait 5s and retry this specific model loop
+            if "429" in last_error:
+                time.sleep(5)
+                # We recurse only once to avoid infinite loops
+                try:
+                    response = model.generate_content(prompt)
+                    text = re.sub(r"```json|```", "", response.text).strip()
+                    st.session_state.working_model_name = model_name
+                    return json.loads(text)
+                except:
+                    pass # Continue to next candidate
+            
+            # If 404 (Not Found), we just continue to the next model in the list
+            continue
+
+    # If all candidates fail
+    return {"error": f"Unable to find a working model for your Key. Last error: {last_error}"}
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
@@ -116,7 +141,7 @@ def batch_translate(api_key, keywords):
         Return JSON: {{ "German": "English" }}"""
         res = run_gemini(api_key, prompt)
         if "error" not in res: full_map.update(res)
-        time.sleep(1.5) 
+        time.sleep(1) # Polite delay
     return full_map
 
 # -----------------------------------------------------------------------------
@@ -164,12 +189,14 @@ with st.sidebar:
     st.markdown("---")
     threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.45, 0.05)
     
-    # Version Debugger (To verify requirements.txt worked)
+    # Debug info
+    if st.session_state.working_model_name:
+        st.success(f"Connected to: {st.session_state.working_model_name}")
+    
     try:
         import google.generativeai as gen_debug
         st.caption(f"GenAI Lib Version: {gen_debug.__version__}")
-    except:
-        st.caption("GenAI Lib: Unknown")
+    except: pass
 
 st.title("German SEO Planner 🇩🇪")
 st.markdown("### High-Speed Semantic Keyword Discovery")
