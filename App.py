@@ -21,9 +21,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
-# NORMALIZATION (central fix for missing mappings)
+# NORMALIZATION FOR KEY LOOKUPS
 # -----------------------------------------------------------------------------
 def normalize_keyword(s: str) -> str:
+    """
+    Normalizes a keyword for stable dict lookups.
+    """
     s = str(s).lower().strip()
     return "".join(c for c in s if c.isalnum() or c.isspace())
 
@@ -56,15 +59,19 @@ st.markdown("""
 if "data_processed" not in st.session_state:
     st.session_state.data_processed = False
     st.session_state.df_results = None
-    st.session_state.synonyms = []
-    st.session_state.strategy_text = ""
-    st.session_state.working_groq_model = None
+    st.session_state.synonyms: List[str] = []
+    st.session_state.strategy_text: str = ""
+    st.session_state.working_groq_model: Optional[str] = None
+    st.session_state.current_topic: str = ""
 
 # -----------------------------------------------------------------------------
 # VECTOR MODEL LOADING
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_gemma_model(hf_token: Optional[str]):
+    """
+    Load the primary embedding model, with fallback if Gemma fails.
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if not hf_token:
         logger.warning("HF token missing. Using MiniLM fallback.")
@@ -78,19 +85,44 @@ def load_gemma_model(hf_token: Optional[str]):
         logger.warning("Gemma model failed, falling back. %r", e)
         return SentenceTransformer("all-MiniLM-L6-v2").to(device)
 
-def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
+def process_keywords_gemma(
+    df_keywords: pd.DataFrame,
+    seeds: List[str],
+    threshold: float,
+    hf_token: Optional[str]
+) -> Optional[pd.DataFrame]:
+    """
+    Compute semantic similarity between candidate keywords and seed phrases.
+
+    Improvement:
+    - Uses both German synonyms and the original English topic as seeds,
+      so relevance is measured to the ENTIRE query meaning, not only generic synonyms.
+    """
     if df_keywords is None or df_keywords.empty:
+        return None
+
+    if "German Keyword" not in df_keywords.columns:
+        logger.warning("DataFrame missing 'German Keyword' column.")
         return None
 
     model = load_gemma_model(hf_token)
     candidates = df_keywords["German Keyword"].astype(str).fillna("").tolist()
-    seeds_clean = [s.strip() for s in seeds if s.strip()]
+    base_seeds = [s.strip() for s in seeds if s and str(s).strip()]
+
+    # Incorporate the original English topic as an extra seed
+    topic = st.session_state.get("current_topic", "")
+    if topic and str(topic).strip():
+        base_seeds.append(str(topic).strip())
+
+    if not base_seeds:
+        logger.warning("No valid seeds for embedding filtering.")
+        return None
 
     try:
-        seed_vecs = model.encode(seeds_clean, prompt_name="STS", normalize_embeddings=True)
+        seed_vecs = model.encode(base_seeds, prompt_name="STS", normalize_embeddings=True)
         cand_vecs = model.encode(candidates, prompt_name="STS", normalize_embeddings=True)
     except TypeError:
-        seed_vecs = model.encode(seeds_clean, normalize_embeddings=True)
+        seed_vecs = model.encode(base_seeds, normalize_embeddings=True)
         cand_vecs = model.encode(candidates, normalize_embeddings=True)
 
     scores = util.cos_sim(cand_vecs, seed_vecs)
@@ -99,42 +131,47 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     df_keywords = df_keywords.copy()
     df_keywords["Relevance"] = max_scores.cpu().numpy()
 
-    out = df_keywords[df_keywords["Relevance"] >= threshold].sort_values("Relevance", ascending=False)
+    out = df_keywords[df_keywords["Relevance"] >= threshold].sort_values(
+        "Relevance", ascending=False
+    )
     return out if not out.empty else None
 
 # -----------------------------------------------------------------------------
 # GROQ ENGINE
 # -----------------------------------------------------------------------------
 def run_groq(api_key: str, prompt: str):
+    """
+    Wrapper around Groq chat.completions with model fallback.
+    """
     client = Groq(api_key=api_key)
 
     models = [
         "llama-3.3-70b-versatile",
         "llama-3.1-70b-versatile",
         "llama-3.2-90b-vision-preview",
-        "llama-3.1-8b-instant"
+        "llama-3.1-8b-instant",
     ]
 
     if st.session_state.working_groq_model:
         models.insert(0, st.session_state.working_groq_model)
 
-    tried = []
+    tried = set()
     last_error = None
 
     for m in models:
         if m in tried:
             continue
-        tried.append(m)
+        tried.add(m)
 
         try:
             resp = client.chat.completions.create(
                 messages=[
                     {"role": "system", "content": "Output strict JSON only."},
-                    {"role": "user", "content": prompt}
+                    {"role": "user", "content": prompt},
                 ],
                 model=m,
                 temperature=0.1,
-                response_format={"type": "json_object"}
+                response_format={"type": "json_object"},
             )
             st.session_state.working_groq_model = m
             return json.loads(resp.choices[0].message.content)
@@ -144,7 +181,7 @@ def run_groq(api_key: str, prompt: str):
             if "401" in last_error:
                 return {"error": "INVALID_KEY"}
             if "429" in last_error:
-                time.sleep(2)
+                time.sleep(2.0)
                 continue
             else:
                 continue
@@ -152,19 +189,32 @@ def run_groq(api_key: str, prompt: str):
     return {"error": f"All models failed. Last error: {last_error}"}
 
 # -----------------------------------------------------------------------------
-# CULTURAL TRANSLATION
+# CULTURAL TRANSLATION (KEEP FULL MEANING OF PHRASE)
 # -----------------------------------------------------------------------------
 def get_cultural_translation(api_key: str, keyword: str):
+    """
+    Ask Groq for German terms representing the FULL meaning of the English phrase,
+    not just the head noun.
+    """
     prompt = f"""
-    Act as a Native German SEO Expert.
-    English Keyword: "{keyword}"
-    Provide 3 German synonyms (colloquial, formal, popular synonym).
-    JSON:
+    Act as a Native German SEO and language expert.
+
+    English search phrase: "{keyword}"
+
+    Task:
+    - Identify the top 3 distinct German search terms that match the COMPLETE meaning
+      of this phrase (including any qualifiers such as audience, location on the body,
+      use-case, etc.), not just the core noun.
+    - These should be realistic search queries or short keyphrases a German user would type
+      when they want the same thing as the English phrase.
+
+    Return STRICT JSON only:
     {{
-      "synonyms": ["t1","t2","t3"],
-      "explanation": "..."
+      "synonyms": ["term1", "term2", "term3"],
+      "explanation": "Brief reasoning of how these terms match the full meaning."
     }}
     """
+
     out = run_groq(api_key, prompt)
     if "error" in out:
         return out
@@ -179,10 +229,14 @@ def get_cultural_translation(api_key: str, keyword: str):
     return out
 
 # -----------------------------------------------------------------------------
-# FIXED VERSION — PER-KEYWORD LLM ANALYSIS
+# PER-KEYWORD LLM ANALYSIS (INTENT + TRANSLATION)
 # -----------------------------------------------------------------------------
 def batch_analyze(api_key: str, keywords: List[str]) -> Dict[str, Dict[str, str]]:
-    results = {}
+    """
+    For each German keyword, get literal English translation and search intent.
+    Uses one Groq call per keyword with strict key matching.
+    """
+    results: Dict[str, Dict[str, str]] = {}
 
     cleaned = [kw.strip() for kw in keywords if kw and str(kw).strip()]
     if not cleaned:
@@ -219,7 +273,6 @@ def batch_analyze(api_key: str, keywords: List[str]) -> Dict[str, Dict[str, str]
             continue
 
         r = ask_single(kw, simple=False)
-
         if not r or kw not in r or not isinstance(r.get(kw), dict):
             r = ask_single(kw, simple=True)
 
@@ -247,19 +300,39 @@ def fetch_suggestions(q: str) -> List[str]:
         data = r.json()
         if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list):
             return [str(x).strip() for x in data[1] if x and str(x).strip()]
-    except:
+    except Exception as e:
+        logger.warning("Autocomplete failed for %r: %r", q, e)
         return []
     return []
 
 def deep_mine(synonyms: List[str]) -> pd.DataFrame:
-    seeds = [s.strip() for s in synonyms if s.strip()]
+    """
+    Mine Google autocomplete around the German synonyms using topical modifiers.
+
+    Improvement:
+    - Modifiers are intent-related (causes, symptoms, treatment, etc.),
+      which are generically relevant across niches and keep semantics tight.
+    """
+    seeds = [s.strip() for s in synonyms if s and str(s).strip()]
     if not seeds:
         return pd.DataFrame(columns=["German Keyword", "Seed"])
 
-    modifiers = ["", " kaufen", " test", " vergleich", " kosten",
-                 " erfahrung", " beste", " anleitung", " was ist"]
+    modifiers = [
+        "",
+        " symptome",
+        " ursachen",
+        " was tun",
+        " behandlung",
+        " therapie",
+        " hausmittel",
+        " bilder",
+        " erfahrung",
+        " test",
+        " vergleich",
+        " kosten",
+    ]
 
-    all_rows = []
+    all_rows: List[Dict[str, str]] = []
     total = len(seeds) * len(modifiers)
     prog = st.progress(0, "Mining Google Autocomplete...")
     step = 0
@@ -268,7 +341,8 @@ def deep_mine(synonyms: List[str]) -> pd.DataFrame:
         for mod in modifiers:
             step += 1
             prog.progress(min(step / total, 1.0))
-            sug = fetch_suggestions(f"{s}{mod}")
+            query = f"{s}{mod}"
+            sug = fetch_suggestions(query)
             for r in sug:
                 all_rows.append({"German Keyword": r, "Seed": s})
 
@@ -292,9 +366,9 @@ with st.sidebar:
     threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.45, 0.05)
 
     try:
-        import groq
+        import groq  # noqa: F401
         st.markdown('<span class="status-badge status-ok">✓ Groq Library Detected</span>', unsafe_allow_html=True)
-    except:
+    except ImportError:
         st.markdown('<span class="status-badge status-err">⚠ Groq Missing</span>', unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
@@ -310,15 +384,17 @@ run_btn = st.button("Generate Keywords", type="primary")
 # EXECUTION PIPELINE
 # -----------------------------------------------------------------------------
 if run_btn:
-    if not keyword.strip():
+    if not keyword or not keyword.strip():
         st.error("Enter a topic.")
         st.stop()
-    if not api_key.strip():
+    if not api_key or not api_key.strip():
         st.error("Enter Groq API key.")
         st.stop()
-    if not hf_token.strip():
+    if not hf_token or not hf_token.strip():
         st.error("Enter Hugging Face token.")
         st.stop()
+
+    st.session_state.current_topic = keyword.strip()
 
     # VECTOR MODEL LOAD
     with st.spinner("Loading vector model..."):
@@ -337,41 +413,47 @@ if run_btn:
 
         syns = strat.get("synonyms", [])
         if not syns:
-            st.error("No synonyms returned.")
+            st.error("No German terms returned for this phrase.")
             st.stop()
 
         st.session_state.synonyms = syns
         st.session_state.strategy_text = strat.get("explanation", "")
 
     # MINE
-    df_raw = deep_mine(syns)
-
+    df_raw = deep_mine(st.session_state.synonyms)
     if df_raw.empty:
         st.warning("No autocomplete suggestions.")
         st.stop()
 
     # FILTER by embeddings
     with st.spinner(f"Filtering {len(df_raw)} keywords..."):
-        df_filtered = process_keywords_gemma(df_raw, syns, threshold, hf_token)
+        df_filtered = process_keywords_gemma(
+            df_raw, st.session_state.synonyms, threshold, hf_token
+        )
 
     if df_filtered is None or df_filtered.empty:
-        st.warning("No keywords met threshold.")
+        st.warning("No keywords met the relevance threshold.")
         st.stop()
 
     # INTENT + TRANSLATION
-    with st.spinner("Analyzing translation + intent..."):
+    with st.spinner("Analyzing translation & intent..."):
         top = df_filtered.head(40)["German Keyword"].astype(str).tolist()
         analysis_map = batch_analyze(api_key, top)
 
-        def get_meta(kw, f):
+        def get_meta(kw: str, field: str) -> str:
             k = normalize_keyword(kw)
-            if k not in analysis_map:
+            meta = analysis_map.get(k)
+            if not meta:
                 return "-"
-            return analysis_map[k].get(f, "-") or "-"
+            return meta.get(field, "-") or "-"
 
         df_filtered = df_filtered.copy()
-        df_filtered["English"] = df_filtered["German Keyword"].apply(lambda x: get_meta(x, "english"))
-        df_filtered["Intent"] = df_filtered["German Keyword"].apply(lambda x: get_meta(x, "intent"))
+        df_filtered["English"] = df_filtered["German Keyword"].apply(
+            lambda x: get_meta(x, "english")
+        )
+        df_filtered["Intent"] = df_filtered["German Keyword"].apply(
+            lambda x: get_meta(x, "intent")
+        )
 
     st.session_state.df_results = df_filtered
     st.session_state.data_processed = True
@@ -382,9 +464,14 @@ if run_btn:
 if st.session_state.data_processed:
     st.success(f"Context: {st.session_state.strategy_text}")
 
-    cols = st.columns(len(st.session_state.synonyms))
-    for i, s in enumerate(st.session_state.synonyms):
-        cols[i].markdown(f"<div class='metric-card'><div class='metric-val'>{s}</div></div>", unsafe_allow_html=True)
+    if st.session_state.synonyms:
+        cols = st.columns(len(st.session_state.synonyms))
+        for i, s in enumerate(st.session_state.synonyms):
+            if i < len(cols):
+                cols[i].markdown(
+                    f"<div class='metric-card'><div class='metric-val'>{s}</div></div>",
+                    unsafe_allow_html=True,
+                )
 
     df_show = st.session_state.df_results
     csv = df_show.to_csv(index=False).encode("utf-8")
@@ -396,6 +483,8 @@ if st.session_state.data_processed:
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Relevance": st.column_config.ProgressColumn("Score", format="%.2f", min_value=0, max_value=1)
-        }
+            "Relevance": st.column_config.ProgressColumn(
+                "Score", format="%.2f", min_value=0.0, max_value=1.0
+            )
+        },
     )
