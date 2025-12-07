@@ -3,7 +3,7 @@ import pandas as pd
 import requests
 import json
 import time
-import random  # Added for jitter
+import random
 from groq import Groq
 import re
 from sentence_transformers import SentenceTransformer, util
@@ -12,7 +12,7 @@ import torch
 # -----------------------------------------------------------------------------
 # 1. VISUAL CONFIGURATION
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="German SEO Planner (Optimized)", layout="wide", page_icon="🇩🇪")
+st.set_page_config(page_title="German SEO Planner (Dynamic Intent)", layout="wide", page_icon="🇩🇪")
 
 st.markdown("""
 <style>
@@ -40,7 +40,7 @@ if 'data_processed' not in st.session_state:
     st.session_state.working_groq_model = None
 
 # -----------------------------------------------------------------------------
-# 3. VECTOR ENGINE (Unchanged - Already Optimal)
+# 3. VECTOR ENGINE (Google Gemma via HuggingFace)
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_gemma_model(hf_token):
@@ -75,6 +75,7 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
 def run_groq(api_key, prompt):
     client = Groq(api_key=api_key)
     
+    # Priority list (Newest first)
     candidates = [
         "llama-3.3-70b-versatile",
         "llama-3.1-70b-versatile",
@@ -133,41 +134,57 @@ def get_cultural_translation(api_key, keyword):
     """
     return run_groq(api_key, prompt)
 
-def batch_translate(api_key, keywords):
+# --- NEW: Dynamic Intent & Translation Analyzer ---
+def batch_analyze(api_key, keywords):
     if not keywords: return {}
     
-    # OPTIMIZATION: Reduced batch size to 30 to prevent "Lost in the Middle" errors
-    # This fixes the missing translation issue.
-    chunk_size = 30
+    # Chunk size 20 for high precision
+    chunk_size = 20
     chunks = [keywords[i:i+chunk_size] for i in range(0, len(keywords), chunk_size)]
-    full_map = {}
+    full_data = {}
     
     for chunk in chunks:
         prompt = f"""
-        Task: Translate these German keywords to English literally.
+        Act as a strict SEO Data Classifier.
         Input List: {json.dumps(chunk)}
-        Output JSON format: {{ "GermanKeyword": "EnglishTranslation", ... }}
+        
+        Task: For each German keyword, provide:
+        1. "english": Literal translation.
+        2. "intent": The Search Intent (choose one: Informational, Transactional, Commercial, Navigational).
+        
+        Rules:
+        - "Transactional": User wants to buy NOW (e.g. buy, price, cheap).
+        - "Commercial": User is researching options (e.g. best, vs, review).
+        - "Informational": User wants answers (e.g. what is, symptoms, help, or generic nouns).
+        
+        Output strict JSON format: 
+        {{ 
+            "GermanKeyword1": {{ "english": "...", "intent": "..." }},
+            "GermanKeyword2": {{ "english": "...", "intent": "..." }}
+        }}
         """
+        
         res = run_groq(api_key, prompt)
-        if "error" not in res: 
-            # Normalization Step: Ensure keys match regardless of case
+        
+        if "error" not in res:
+            # Normalize keys (lowercase/strip) to ensure matching works even if AI changes case
             normalized_res = {k.lower().strip(): v for k, v in res.items()}
-            full_map.update(normalized_res)
+            full_data.update(normalized_res)
+            
         time.sleep(0.5) 
-    return full_map
+        
+    return full_data
 
 # -----------------------------------------------------------------------------
-# 5. MINING (OPTIMIZED)
+# 5. MINING (ROBUST & RAW)
 # -----------------------------------------------------------------------------
 def fetch_suggestions(query):
     url = f"http://google.com/complete/search?client=chrome&q={query}&hl=de&gl=de"
-    # OPTIMIZATION: Added User-Agent headers to look like a browser
-    # This reduces the chance of being blocked by Google (429 errors).
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     try:
-        # Added random jitter to appear human
+        # Jitter to avoid bot detection
         time.sleep(random.uniform(0.1, 0.3))
         r = requests.get(url, headers=headers, timeout=2.0)
         if r.status_code == 200: return r.json()[1]
@@ -175,7 +192,9 @@ def fetch_suggestions(query):
     return []
 
 def deep_mine(synonyms):
-    modifiers = ["", " kaufen", " test", " vergleich", " kosten", " erfahrung", " beste"]
+    # Modifiers only used to TRIGGER specific autocompletes.
+    # We do NOT use them to guess intent anymore.
+    modifiers = ["", " kaufen", " test", " vergleich", " kosten", " erfahrung", " beste", " anleitung", " was ist"]
     all_data = []
     prog = st.progress(0, "Mining Google Autocomplete...")
     total = len(synonyms) * len(modifiers)
@@ -187,13 +206,10 @@ def deep_mine(synonyms):
             if total > 0: prog.progress(min(step/total, 1.0))
             
             results = fetch_suggestions(f"{seed}{mod}")
-            intent = "Informational"
-            if "kaufen" in mod or "kosten" in mod: intent = "Transactional"
-            elif "test" in mod or "vergleich" in mod or "beste" in mod: intent = "Commercial"
-            elif "erfahrung" in mod: intent = "Review"
             
             for r in results:
-                all_data.append({"German Keyword": r, "Seed": seed, "Intent": intent})
+                # Store raw data. AI will analyze intent later.
+                all_data.append({"German Keyword": r, "Seed": seed})
             
     prog.empty()
     df = pd.DataFrame(all_data)
@@ -217,20 +233,22 @@ with st.sidebar:
     except ImportError:
         st.markdown('<span class="status-badge status-err">⚠ Groq Missing</span>', unsafe_allow_html=True)
 
-st.title("German SEO Planner 🇩🇪 (Optimized)")
+st.title("German SEO Planner 🇩🇪 (Dynamic Intent)")
 st.markdown("### High-Speed Semantic Keyword Discovery")
 
-keyword = st.text_input("Enter English Topic", placeholder="e.g. coffee machines")
+keyword = st.text_input("Enter English Topic", placeholder="e.g. heat rash in babies")
 run_btn = st.button("Generate Keywords", type="primary")
 
 if run_btn and keyword and api_key and hf_token:
     st.session_state.data_processed = False
     
+    # 1. LOAD VECTORS
     with st.spinner("Loading Vector Model..."):
         try: _ = load_gemma_model(hf_token)
         except: st.stop()
 
-    with st.spinner("Analyzing Cultural Context (Llama 3.3)..."):
+    # 2. STRATEGY (Llama 3.3)
+    with st.spinner("Analyzing Cultural Context..."):
         strategy = get_cultural_translation(api_key, keyword)
         
         if not strategy: st.error("No response."); st.stop()
@@ -243,23 +261,30 @@ if run_btn and keyword and api_key and hf_token:
         st.session_state.synonyms = strategy.get('synonyms', [])
         st.session_state.strategy_text = strategy.get('explanation', '')
 
+    # 3. MINE
     df = deep_mine(st.session_state.synonyms)
     
     if not df.empty:
         with st.spinner(f"Filtering {len(df)} keywords..."):
+            # Filter first to save AI tokens
             df_filtered = process_keywords_gemma(df, st.session_state.synonyms, threshold, hf_token)
             
         if df_filtered is not None and not df_filtered.empty:
-            with st.spinner("Translating..."):
+            with st.spinner("AI Analyzing Translation & Intent..."):
                 top = df_filtered.head(40)['German Keyword'].tolist()
-                trans_map = batch_translate(api_key, top)
                 
-                # OPTIMIZATION: Robust Mapping
-                # We normalize the dataframe keyword to lowercase/strip before mapping
-                # This ensures we find the translation even if cases don't match exactly.
-                df_filtered['English'] = df_filtered['German Keyword'].apply(
-                    lambda x: trans_map.get(x.lower().strip(), "-")
-                )
+                # Dynamic Analysis via Groq
+                analysis_map = batch_analyze(api_key, top)
+                
+                # Safe Mapping Function
+                def get_meta(kw, field):
+                    clean_kw = kw.lower().strip()
+                    if clean_kw in analysis_map:
+                        return analysis_map[clean_kw].get(field, "-")
+                    return "-"
+
+                df_filtered['English'] = df_filtered['German Keyword'].apply(lambda x: get_meta(x, 'english'))
+                df_filtered['Intent'] = df_filtered['German Keyword'].apply(lambda x: get_meta(x, 'intent'))
             
             st.session_state.df_results = df_filtered
             st.session_state.data_processed = True
