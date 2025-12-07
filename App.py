@@ -48,47 +48,38 @@ if 'data_processed' not in st.session_state:
     st.session_state.briefs = {} 
 
 # -----------------------------------------------------------------------------
-# 3. VECTOR ENGINE (EmbeddingGemma - Fixed Auth)
+# 3. VECTOR ENGINE (EmbeddingGemma)
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_gemma_model(hf_token):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
-        # Updated 'use_auth_token' to 'token' for newer library versions
         return SentenceTransformer("google/embeddinggemma-300m", token=hf_token).to(device)
     except Exception as e:
-        # Fallback to a standard model if Gemma fails (to prevent app crash)
-        st.error(f"Gemma Load Error: {e}. Falling back to standard model.")
+        st.error(f"Gemma Load Error: {e}. Using fallback.")
         return SentenceTransformer("all-MiniLM-L6-v2")
 
 def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     model = load_gemma_model(hf_token)
     if not model: return None, None
     
-    # --- A. SCORING ---
     try:
         seed_vecs = model.encode(seeds, prompt_name="STS", normalize_embeddings=True)
         candidates = df_keywords['German Keyword'].tolist()
         candidate_vecs = model.encode(candidates, prompt_name="STS", normalize_embeddings=True)
     except TypeError:
-        # Fallback for models that don't support prompts
         seed_vecs = model.encode(seeds, normalize_embeddings=True)
         candidates = df_keywords['German Keyword'].tolist()
         candidate_vecs = model.encode(candidates, normalize_embeddings=True)
     
     scores_matrix = util.cos_sim(candidate_vecs, seed_vecs)
     max_scores, _ = torch.max(scores_matrix, dim=1)
-    
     df_keywords['Relevance'] = max_scores.numpy()
     
-    # Filter noise
     df_relevant = df_keywords[df_keywords['Relevance'] >= threshold].copy()
-    
-    # --- B. SPLITTING ---
     df_direct = df_relevant[df_relevant['Relevance'] > 0.65].copy()
     df_clusters = df_relevant[df_relevant['Relevance'] <= 0.65].copy()
     
-    # --- C. CLUSTERING ---
     if len(df_clusters) > 2:
         try:
             cluster_vecs = model.encode(df_clusters['German Keyword'].tolist(), prompt_name="Clustering", normalize_embeddings=True)
@@ -99,7 +90,6 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
         cluster_ids = clustering.fit_predict(cluster_vecs)
         df_clusters['Cluster ID'] = cluster_ids
         
-        # Name clusters
         cluster_names = {}
         for cid in np.unique(cluster_ids):
             subset = df_clusters[df_clusters['Cluster ID'] == cid]
@@ -114,54 +104,71 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     return df_direct.sort_values('Relevance', ascending=False), df_clusters.sort_values('Cluster ID')
 
 # -----------------------------------------------------------------------------
-# 4. GENERATIVE ENGINE (FINAL FIX: Cascade Strategy + Rate Limit Handling)
+# 4. GENERATIVE ENGINE (FINAL FIX: Dynamic Discovery + Caching)
 # -----------------------------------------------------------------------------
+
+# NEW FUNCTION: Finds the correct model name ONCE and caches it
+@st.cache_data(show_spinner="Connecting to Google AI...", ttl=3600)
+def get_valid_gemini_model(api_key):
+    genai.configure(api_key=api_key)
+    try:
+        # 1. Ask Google what we have access to
+        models = list(genai.list_models())
+        
+        # 2. Filter for models that can generate content
+        valid_models = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+        
+        if not valid_models:
+            return None
+
+        # 3. Pick the best one intelligently
+        # Priority: Flash -> 1.5 -> Pro -> Anything else
+        for m in valid_models:
+            if 'flash' in m and '1.5' in m: return m
+        for m in valid_models:
+            if 'pro' in m and '1.5' in m: return m
+        for m in valid_models:
+            if 'gemini' in m: return m
+            
+        return valid_models[0]
+    except Exception as e:
+        return None
+
 def run_gemini(api_key, prompt, retries=0):
-    # 1. Stop if we've retried too many times (prevents infinite loops)
     if retries > 3:
-        return {"error": "⚠️ API Rate Limit Hit (429). Please wait a minute or check your API key quota."}
+        return {"error": "⚠️ API Limit Hit. Please wait 1 minute."}
+
+    # 1. Get the correct model name dynamically
+    model_name = get_valid_gemini_model(api_key)
+    if not model_name:
+        # If discovery fails, try a safe default as a last resort
+        model_name = "models/gemini-1.5-flash"
 
     genai.configure(api_key=api_key)
     
-    # 2. MODEL LIST: Try these in order. If one fails (404), we try the next.
-    # 'gemini-1.5-flash' is fastest. 'gemini-pro' is the most compatible fallback.
-    candidates = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
-    
-    last_error = None
-
-    for model_name in candidates:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            
-            # 3. Parse JSON cleanly
-            text = response.text
-            # Remove Markdown formatting if present
-            text = re.sub(r"```json", "", text)
-            text = re.sub(r"```", "", text)
-            text = text.strip()
-            
-            return json.loads(text)
-
-        except Exception as e:
-            last_error = str(e)
-            
-            # CASE A: RATE LIMIT (429) -> Wait and Retry the whole function
-            if "429" in last_error:
-                time.sleep(2 * (retries + 1)) # Exponential Backoff: 2s, 4s, 6s...
-                return run_gemini(api_key, prompt, retries=retries+1)
-            
-            # CASE B: MODEL NOT FOUND (404) -> Continue to next model in loop
-            if "404" in last_error or "not found" in last_error.lower():
-                continue 
-            
-            # CASE C: INVALID KEY / AUTH ERROR -> Return error immediately (don't retry)
-            if "400" in last_error or "403" in last_error:
-                return {"error": f"API Key Error: {last_error}"}
-
-    # If we tried all models and they all failed
-    return {"error": f"All AI models failed. Last error: {last_error}"}
+    try:
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(prompt)
         
+        text = response.text
+        text = re.sub(r"```json", "", text)
+        text = re.sub(r"```", "", text)
+        text = text.strip()
+        return json.loads(text)
+        
+    except Exception as e:
+        err = str(e)
+        # 429 = Rate Limit (Wait and Retry)
+        if "429" in err: 
+            time.sleep(2 * (retries + 1))
+            return run_gemini(api_key, prompt, retries=retries+1)
+        # 404 = Model name issue (Clear cache and retry once)
+        if "404" in err and retries == 0:
+            get_valid_gemini_model.clear() # Reset cache
+            return run_gemini(api_key, prompt, retries=retries+1)
+            
+        return {"error": f"AI Error: {err}"}
+
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
     Act as a Native German SEO Expert.
@@ -178,7 +185,6 @@ def get_cultural_translation(api_key, keyword):
 
 def batch_translate(api_key, keywords):
     if not keywords: return {}
-    # Reduced chunk size to prevent API timeouts
     chunks = [keywords[i:i+30] for i in range(0, len(keywords), 30)]
     full_map = {}
     for chunk in chunks:
@@ -225,7 +231,6 @@ def deep_mine(synonyms):
         for mod in modifiers:
             step += 1; 
             if total > 0: prog.progress(min(step/total, 1.0), f"Mining: {seed}{mod}...")
-            
             results = fetch_suggestions(f"{seed}{mod}")
             
             intent = "Informational"
@@ -241,25 +246,6 @@ def deep_mine(synonyms):
     df = pd.DataFrame(all_data)
     if not df.empty: return df.drop_duplicates(subset=['German Keyword'])
     return df
-
-def fetch_smart_trends(df_keywords):
-    # Limit trends to top 5 to avoid timeouts
-    candidates = df_keywords.sort_values(by="German Keyword", key=lambda x: x.str.len()).head(5)['German Keyword'].tolist()
-    trend_map = {}
-    try:
-        pytrends = TrendReq(hl='de-DE', tz=360)
-        # Handle empty lists
-        if candidates:
-            pytrends.build_payload(candidates, cat=0, timeframe='today 3-m', geo='DE')
-            data = pytrends.interest_over_time()
-            if not data.empty:
-                means = data.mean()
-                for kw in candidates:
-                    if kw in means: trend_map[kw] = int(means[kw])
-    except Exception as e: 
-        print(f"Trend Error: {e}")
-        pass
-    return trend_map
 
 # -----------------------------------------------------------------------------
 # 6. UI & MAIN LOGIC
@@ -330,7 +316,6 @@ if run_btn and keyword and api_key and hf_token:
             if not df_direct.empty: all_kws.extend(df_direct['German Keyword'].tolist())
             if not df_clustered.empty: all_kws.extend(df_clustered['German Keyword'].tolist())
             
-            # De-duplicate to save tokens
             trans_map = batch_translate(api_key, list(set(all_kws)))
             
             if not df_direct.empty:
@@ -338,11 +323,7 @@ if run_btn and keyword and api_key and hf_token:
             
             if not df_clustered.empty:
                 df_clustered['English'] = df_clustered['German Keyword'].map(trans_map).fillna("-")
-                
-                # Trends (Optional - might be slow)
-                # trends = fetch_smart_trends(df_clustered)
-                # df_clustered['Trend'] = df_clustered['German Keyword'].map(trends).fillna("-")
-                df_clustered['Trend'] = "-" # Disabled for speed
+                df_clustered['Trend'] = "-" 
 
         st.session_state.df_direct = df_direct
         st.session_state.df_clustered = df_clustered
@@ -418,5 +399,3 @@ if st.session_state.data_processed:
 
 elif not st.session_state.data_processed and run_btn:
     st.error("Please provide API Keys.")
-
-
