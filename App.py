@@ -70,72 +70,57 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     return df_relevant.sort_values('Relevance', ascending=False)
 
 # -----------------------------------------------------------------------------
-# 4. GENERATIVE ENGINE (CACHED DISCOVERY)
+# 4. GENERATIVE ENGINE (DIRECT ACCESS - QUOTA SAVER)
 # -----------------------------------------------------------------------------
-
-# This function runs ONCE per hour. It finds the correct model name
-# without wasting your API quota on every click.
-@st.cache_data(ttl=3600, show_spinner="Connecting to Google AI...")
-def find_working_model(api_key):
-    genai.configure(api_key=api_key)
-    try:
-        # List all models available to your specific key
-        all_models = list(genai.list_models())
-        
-        # Filter for models that can generate text
-        valid_models = [m.name for m in all_models if 'generateContent' in m.supported_generation_methods]
-        
-        if not valid_models:
-            return None
-            
-        # Select the best one: Flash -> Pro -> Standard
-        for m in valid_models:
-            if 'flash' in m and '1.5' in m: return m
-        for m in valid_models:
-            if 'pro' in m and '1.5' in m: return m
-        for m in valid_models:
-            if 'gemini' in m: return m
-            
-        return valid_models[0]
-        
-    except Exception:
-        # If listing fails (e.g. strict quota), return None to trigger fallback
-        return None
-
 def run_gemini(api_key, prompt, retries=0):
+    # Stop if we are stuck in a loop
     if retries > 3:
-        return {"error": "⚠️ API limit hit. Please wait a moment."}
-
-    # 1. Get the correct model name (Cached)
-    model_name = find_working_model(api_key)
-    
-    # 2. Fallback if discovery failed (e.g. due to quota on the listing call)
-    if not model_name:
-        model_name = "models/gemini-1.5-flash"
+        return {"error": "⚠️ API limit hit (429). Please wait 30 seconds and try again."}
 
     genai.configure(api_key=api_key)
     
-    try:
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(prompt)
-        text = re.sub(r"```json|```", "", response.text).strip()
-        return json.loads(text)
+    # NOW WE CAN USE DIRECT NAMES (Since library is updated)
+    # This saves the "Listing" call, doubling your effective quota.
+    candidates = [
+        "models/gemini-1.5-flash", # Fastest, highest free limits
+        "models/gemini-1.5-flash-latest",
+        "models/gemini-1.5-pro",
+        "models/gemini-pro"
+    ]
+    
+    last_error = None
 
-    except Exception as e:
-        last_error = str(e)
-        
-        # Rate Limit (429): Wait and retry
-        if "429" in last_error:
-            time.sleep(5) 
-            return run_gemini(api_key, prompt, retries=retries+1)
-        
-        # Model Not Found (404): Clear cache and retry once
-        # This handles cases where the key permissions changed
-        if "404" in last_error and retries == 0:
-            find_working_model.clear() 
-            return run_gemini(api_key, prompt, retries=retries+1)
+    for model_name in candidates:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            
+            # Clean response
+            text = re.sub(r"```json|```", "", response.text).strip()
+            return json.loads(text)
 
-        return {"error": f"AI Error ({model_name}): {last_error}"}
+        except Exception as e:
+            last_error = str(e)
+            
+            # CASE: Rate Limit (429)
+            # The free tier needs a real pause to reset.
+            if "429" in last_error:
+                # Wait 10 seconds (exponential backoff)
+                wait_time = 10 * (retries + 1)
+                time.sleep(wait_time)
+                # Retry the same function
+                return run_gemini(api_key, prompt, retries=retries+1)
+            
+            # CASE: Model Not Found (404)
+            # Just try the next one in the list
+            if "404" in last_error or "not found" in last_error.lower():
+                continue
+            
+            # CASE: Key Error
+            if "API key" in last_error or "403" in last_error:
+                return {"error": "Invalid API Key."}
+
+    return {"error": f"All models failed. Last error: {last_error}"}
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
@@ -151,15 +136,15 @@ def get_cultural_translation(api_key, keyword):
 
 def batch_translate(api_key, keywords):
     if not keywords: return {}
-    # Increased chunk size to save calls
-    chunks = [keywords[i:i+50] for i in range(0, len(keywords), 50)]
+    # Chunking: 40 keywords per call
+    chunks = [keywords[i:i+40] for i in range(0, len(keywords), 40)]
     full_map = {}
     for chunk in chunks:
         prompt = f"""Translate German to English (Literal): {json.dumps(chunk)}. 
         Return JSON: {{ "German": "English" }}"""
         res = run_gemini(api_key, prompt)
         if "error" not in res: full_map.update(res)
-        time.sleep(1)
+        time.sleep(2) # Polite delay
     return full_map
 
 # -----------------------------------------------------------------------------
@@ -210,10 +195,6 @@ with st.sidebar:
     hf_token = st.text_input("Hugging Face Token", type="password")
     st.markdown("---")
     threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.45, 0.05)
-    
-    if st.button("Reset Cache"):
-        st.cache_data.clear()
-        st.success("Cache cleared!")
 
 st.title("German SEO Planner 🇩🇪")
 st.markdown("### High-Speed Semantic Keyword Discovery")
@@ -238,7 +219,6 @@ if run_btn and keyword and api_key and hf_token:
             st.stop()
         if "error" in strategy:
             st.error(f"{strategy['error']}")
-            st.warning("Tip: If you see a 404, check your API key permissions.")
             st.stop()
             
         st.session_state.synonyms = strategy.get('synonyms', [])
