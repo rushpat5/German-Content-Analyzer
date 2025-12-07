@@ -70,77 +70,46 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     return df_relevant.sort_values('Relevance', ascending=False)
 
 # -----------------------------------------------------------------------------
-# 4. GENERATIVE ENGINE (ROBUST & DYNAMIC)
+# 4. GENERATIVE ENGINE (SUPER LITE - NO LISTING)
 # -----------------------------------------------------------------------------
-@st.cache_data(show_spinner="Connecting to Google AI...", ttl=3600)
-def get_valid_gemini_model(api_key):
-    """Dynamically finds the best available model for the API key."""
-    genai.configure(api_key=api_key)
-    try:
-        # 1. Ask Google what we have
-        models = list(genai.list_models())
-        valid = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        
-        if not valid: return None
-
-        # 2. Priority Selection
-        # Flash is fastest -> Pro is smartest -> Standard is fallback
-        for m in valid:
-            if 'flash' in m and '1.5' in m: return m
-        for m in valid:
-            if 'pro' in m and '1.5' in m: return m
-        for m in valid:
-            if 'gemini' in m: return m
-            
-        return valid[0]
-    except Exception:
-        return None
-
 def run_gemini(api_key, prompt, retries=0):
+    # Stop recursion if deep
     if retries > 3:
-        return {"error": "⚠️ Max retries exceeded (API Rate Limit or Network Issue)."}
+        return {"error": "⚠️ API Quota Exceeded. Please wait 1 minute."}
 
     genai.configure(api_key=api_key)
     
-    # 1. Try Dynamic Discovery first (Cached)
-    model_name = get_valid_gemini_model(api_key)
-    
-    # 2. If discovery failed, try a hardcoded cascade of known models
-    # This ensures we don't crash just because listing models failed.
-    candidates = []
-    if model_name:
-        candidates.append(model_name)
-    candidates.extend(["models/gemini-1.5-flash", "models/gemini-1.5-pro", "models/gemini-pro"])
-    
-    # Remove duplicates while preserving order
-    candidates = list(dict.fromkeys(candidates))
+    # HARDCODED CASCADE: Saves API calls by not "listing" models first.
+    # 1. Flash (Fastest, cheapest)
+    # 2. Pro (Smartest fallback)
+    # 3. Standard (Legacy fallback)
+    candidates = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
     
     last_error = None
 
-    for model_candidate in candidates:
+    for model_name in candidates:
         try:
-            model = genai.GenerativeModel(model_candidate)
+            model = genai.GenerativeModel(model_name)
             response = model.generate_content(prompt)
             
-            # Parse response
             text = re.sub(r"```json|```", "", response.text).strip()
             return json.loads(text)
 
         except Exception as e:
             last_error = str(e)
             
-            # Rate Limit (429) -> Wait and retry same model or logic
+            # CASE: Rate Limit (429) -> Wait 5s and Retry (Recurse)
             if "429" in last_error:
-                time.sleep(2 * (retries + 1))
+                time.sleep(5) 
                 return run_gemini(api_key, prompt, retries=retries+1)
             
-            # Model Not Found (404) -> Continue loop to next candidate
+            # CASE: Model Not Found (404) -> Just try the next model in the list
             if "404" in last_error or "not found" in last_error.lower():
                 continue
-                
-            # Authentication Error -> Stop immediately
-            if "API key not valid" in last_error or "400" in last_error:
-                return {"error": f"Invalid API Key: {last_error}"}
+            
+            # CASE: Bad Key -> Stop
+            if "API key not valid" in last_error or "403" in last_error:
+                return {"error": "Invalid API Key."}
 
     return {"error": f"All models failed. Last error: {last_error}"}
 
@@ -158,15 +127,15 @@ def get_cultural_translation(api_key, keyword):
 
 def batch_translate(api_key, keywords):
     if not keywords: return {}
-    # Chunking to prevent timeouts
-    chunks = [keywords[i:i+40] for i in range(0, len(keywords), 40)]
+    # Larger chunks = fewer API calls
+    chunks = [keywords[i:i+50] for i in range(0, len(keywords), 50)]
     full_map = {}
     for chunk in chunks:
         prompt = f"""Translate German to English (Literal): {json.dumps(chunk)}. 
         Return JSON: {{ "German": "English" }}"""
         res = run_gemini(api_key, prompt)
         if "error" not in res: full_map.update(res)
-        time.sleep(0.5)
+        time.sleep(1) # Polite delay between chunks
     return full_map
 
 # -----------------------------------------------------------------------------
@@ -175,13 +144,14 @@ def batch_translate(api_key, keywords):
 def fetch_suggestions(query):
     url = f"http://google.com/complete/search?client=chrome&q={query}&hl=de&gl=de"
     try:
-        r = requests.get(url, timeout=1.5)
+        r = requests.get(url, timeout=1.0)
         if r.status_code == 200: return r.json()[1]
     except: pass
     return []
 
 def deep_mine(synonyms):
-    modifiers = ["", " für", " bei", " gegen", " hausmittel", " kaufen", " test"]
+    # Minimal modifiers for speed
+    modifiers = ["", " kaufen", " test", " vergleich", " kosten"]
     all_data = []
     
     prog = st.progress(0, "Mining Google Autocomplete...")
@@ -196,13 +166,12 @@ def deep_mine(synonyms):
             results = fetch_suggestions(f"{seed}{mod}")
             
             intent = "Informational"
-            if "kaufen" in mod or "preis" in mod: intent = "Transactional"
-            elif "gegen" in mod or "mittel" in mod: intent = "Commercial/Solution"
-            elif "test" in mod or "vergleich" in mod: intent = "Commercial Investigation"
+            if "kaufen" in mod or "kosten" in mod: intent = "Transactional"
+            elif "test" in mod or "vergleich" in mod: intent = "Commercial"
             
             for r in results:
                 all_data.append({"German Keyword": r, "Seed": seed, "Intent": intent})
-            time.sleep(0.05)
+            time.sleep(0.02)
             
     prog.empty()
     df = pd.DataFrame(all_data)
@@ -218,7 +187,6 @@ with st.sidebar:
     hf_token = st.text_input("Hugging Face Token", type="password")
     st.markdown("---")
     threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.45, 0.05)
-    st.caption("Lower = More results. Higher = Stricter relevance.")
 
 st.title("German SEO Planner 🇩🇪")
 st.markdown("### High-Speed Semantic Keyword Discovery")
@@ -230,7 +198,7 @@ if run_btn and keyword and api_key and hf_token:
     st.session_state.data_processed = False
     
     # 1. Load Model
-    with st.spinner("Loading AI Models..."):
+    with st.spinner("Loading Vector Model..."):
         try: _ = load_gemma_model(hf_token)
         except: st.stop()
 
@@ -238,18 +206,11 @@ if run_btn and keyword and api_key and hf_token:
     with st.spinner("Analyzing Cultural Context..."):
         strategy = get_cultural_translation(api_key, keyword)
         
-        # IMPROVED ERROR HANDLING
         if not strategy:
-            st.error("Gemini returned no data. Please try again.")
+            st.error("No response from Gemini.")
             st.stop()
         if "error" in strategy:
-            st.error(f"❌ Gemini API Error: {strategy['error']}")
-            st.markdown("""
-            **Troubleshooting:**
-            1. Check if your API Key is valid.
-            2. Check if you have free quota left (60 reqs/min).
-            3. Wait 1 minute and try again.
-            """)
+            st.error(f"{strategy['error']}")
             st.stop()
             
         st.session_state.synonyms = strategy.get('synonyms', [])
@@ -264,24 +225,23 @@ if run_btn and keyword and api_key and hf_token:
             df_filtered = process_keywords_gemma(df, st.session_state.synonyms, threshold, hf_token)
             
         if df_filtered is not None and not df_filtered.empty:
-            # 5. Translate (Only the good ones)
+            # 5. Translate (Only top 30 to save quota)
             with st.spinner("Translating Top Results..."):
-                keywords_to_translate = df_filtered['German Keyword'].tolist()
-                trans_map = batch_translate(api_key, keywords_to_translate)
+                top_keywords = df_filtered.head(30)['German Keyword'].tolist()
+                trans_map = batch_translate(api_key, top_keywords)
                 df_filtered['English'] = df_filtered['German Keyword'].map(trans_map).fillna("-")
             
             st.session_state.df_results = df_filtered
             st.session_state.data_processed = True
         else:
-            st.warning("Keywords found, but none met the relevance threshold. Try lowering it.")
+            st.warning("No relevant keywords found. Lower the threshold.")
     else:
         st.warning("No keywords found via Autocomplete.")
 
 # --- DISPLAY RESULTS ---
 if st.session_state.data_processed:
     
-    # Context
-    st.success(f"**Cultural Insight:** {st.session_state.strategy_text}")
+    st.success(f"**Insight:** {st.session_state.strategy_text}")
     cols = st.columns(len(st.session_state.synonyms))
     for i, syn in enumerate(st.session_state.synonyms):
         if i < len(cols):
@@ -291,20 +251,15 @@ if st.session_state.data_processed:
     
     df_show = st.session_state.df_results
     
-    # Download Button
     csv = df_show.to_csv(index=False).encode('utf-8')
-    c1, c2 = st.columns([4,1])
-    with c2:
-        st.download_button("📥 Download CSV", csv, "german_keywords.csv", "text/csv", use_container_width=True)
+    st.download_button("📥 Download CSV", csv, "german_keywords.csv", "text/csv")
     
-    # Data Table
     st.dataframe(
         df_show[['German Keyword', 'English', 'Intent', 'Relevance']],
         use_container_width=True,
         hide_index=True,
         column_config={
             "Relevance": st.column_config.ProgressColumn("Vector Match", format="%.2f", min_value=0, max_value=1),
-            "Intent": st.column_config.TextColumn("Search Intent", width="medium")
         }
     )
 
