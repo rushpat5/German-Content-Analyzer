@@ -11,7 +11,7 @@ import torch
 # -----------------------------------------------------------------------------
 # 1. VISUAL CONFIGURATION
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="German SEO Planner (Stable)", layout="wide", page_icon="🇩🇪")
+st.set_page_config(page_title="German SEO Planner (Final)", layout="wide", page_icon="🇩🇪")
 
 st.markdown("""
 <style>
@@ -25,15 +25,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. SESSION STATE & MODEL MEMORY
+# 2. SESSION STATE
 # -----------------------------------------------------------------------------
 if 'data_processed' not in st.session_state:
     st.session_state.data_processed = False
     st.session_state.df_results = None
     st.session_state.synonyms = []
     st.session_state.strategy_text = ""
-    # This stores the working model name so we don't guess every time
-    st.session_state.working_model_name = None 
 
 # -----------------------------------------------------------------------------
 # 3. VECTOR ENGINE (Lightweight)
@@ -66,60 +64,61 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     return df_keywords[df_keywords['Relevance'] >= threshold].sort_values('Relevance', ascending=False)
 
 # -----------------------------------------------------------------------------
-# 4. GENERATIVE ENGINE (SELF-HEALING)
+# 4. GENERATIVE ENGINE (CACHED MODEL DISCOVERY)
 # -----------------------------------------------------------------------------
-def run_gemini(api_key, prompt):
+
+# This function runs ONCE. It asks Google what models you actually have.
+# It solves the 404 error by getting the EXACT name your key supports.
+@st.cache_resource(show_spinner="Connecting to Google...", ttl=3600)
+def find_best_model(api_key):
     genai.configure(api_key=api_key)
-    
-    # 1. If we already found a working model, use it directly.
-    if st.session_state.working_model_name:
-        candidates = [st.session_state.working_model_name]
-    else:
-        # 2. If not, try these in order until one works
-        candidates = [
-            "gemini-1.5-flash",       # Latest fast model
-            "gemini-1.5-pro",         # Latest robust model
-            "gemini-pro",             # Legacy model (Most compatible)
-            "models/gemini-1.5-flash" # Alternative naming
-        ]
-    
-    last_error = None
+    try:
+        # 1. Ask Google: "What models do I have?"
+        all_models = list(genai.list_models())
+        
+        # 2. Filter: Only models that generate text
+        valid_models = [m.name for m in all_models if 'generateContent' in m.supported_generation_methods]
+        
+        if not valid_models:
+            return "ERROR_NO_MODELS"
+            
+        # 3. Smart Selection (Priority: Flash -> Pro -> Standard)
+        # We look for specific strings in the names returned by Google
+        for m in valid_models:
+            if 'flash' in m and '1.5' in m: return m
+        for m in valid_models:
+            if 'pro' in m and '1.5' in m: return m
+        for m in valid_models:
+            if 'gemini-pro' in m: return m
+            
+        # 4. Fallback: Just take the first one available
+        return valid_models[0]
+        
+    except Exception as e:
+        err_str = str(e)
+        if "429" in err_str: return "ERROR_QUOTA"
+        if "API key" in err_str: return "ERROR_KEY"
+        return f"ERROR_UNKNOWN: {err_str}"
 
-    for model_name in candidates:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            
-            # Clean response
-            text = re.sub(r"```json|```", "", response.text).strip()
-            
-            # SUCCESS! Save this model name for future calls
-            st.session_state.working_model_name = model_name
-            
-            return json.loads(text)
+def run_gemini(api_key, model_name, prompt):
+    genai.configure(api_key=api_key)
+    try:
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(prompt)
+        text = re.sub(r"```json|```", "", response.text).strip()
+        return json.loads(text)
+    except Exception as e:
+        # Simple retry for transient network issues
+        if "429" in str(e):
+            time.sleep(5)
+            try:
+                response = model.generate_content(prompt)
+                text = re.sub(r"```json|```", "", response.text).strip()
+                return json.loads(text)
+            except: pass
+        return {"error": str(e)}
 
-        except Exception as e:
-            last_error = str(e)
-            
-            # If Rate Limit (429), wait 5s and retry this specific model loop
-            if "429" in last_error:
-                time.sleep(5)
-                # We recurse only once to avoid infinite loops
-                try:
-                    response = model.generate_content(prompt)
-                    text = re.sub(r"```json|```", "", response.text).strip()
-                    st.session_state.working_model_name = model_name
-                    return json.loads(text)
-                except:
-                    pass # Continue to next candidate
-            
-            # If 404 (Not Found), we just continue to the next model in the list
-            continue
-
-    # If all candidates fail
-    return {"error": f"Unable to find a working model for your Key. Last error: {last_error}"}
-
-def get_cultural_translation(api_key, keyword):
+def get_cultural_translation(api_key, model_name, keyword):
     prompt = f"""
     Act as a Native German SEO Expert.
     English Keyword: "{keyword}"
@@ -129,19 +128,18 @@ def get_cultural_translation(api_key, keyword):
     3. A popular synonym.
     Return STRICT JSON: {{ "synonyms": ["term1", "term2", "term3"], "explanation": "Brief reasoning" }}
     """
-    return run_gemini(api_key, prompt)
+    return run_gemini(api_key, model_name, prompt)
 
-def batch_translate(api_key, keywords):
+def batch_translate(api_key, model_name, keywords):
     if not keywords: return {}
-    # 50 keywords per batch
     chunks = [keywords[i:i+50] for i in range(0, len(keywords), 50)]
     full_map = {}
     for chunk in chunks:
         prompt = f"""Translate German to English (Literal): {json.dumps(chunk)}. 
         Return JSON: {{ "German": "English" }}"""
-        res = run_gemini(api_key, prompt)
+        res = run_gemini(api_key, model_name, prompt)
         if "error" not in res: full_map.update(res)
-        time.sleep(1) # Polite delay
+        time.sleep(1)
     return full_map
 
 # -----------------------------------------------------------------------------
@@ -189,14 +187,9 @@ with st.sidebar:
     st.markdown("---")
     threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.45, 0.05)
     
-    # Debug info
-    if st.session_state.working_model_name:
-        st.success(f"Connected to: {st.session_state.working_model_name}")
-    
-    try:
-        import google.generativeai as gen_debug
-        st.caption(f"GenAI Lib Version: {gen_debug.__version__}")
-    except: pass
+    if st.button("🔄 Reset Connection"):
+        st.cache_resource.clear()
+        st.experimental_rerun()
 
 st.title("German SEO Planner 🇩🇪")
 st.markdown("### High-Speed Semantic Keyword Discovery")
@@ -207,21 +200,41 @@ run_btn = st.button("Generate Keywords", type="primary")
 if run_btn and keyword and api_key and hf_token:
     st.session_state.data_processed = False
     
+    # 1. ESTABLISH MODEL CONNECTION (Robust)
+    with st.spinner("Connecting to Google AI (One-time check)..."):
+        model_name = find_best_model(api_key)
+        
+        # ERROR HANDLING FOR CONNECTION
+        if model_name == "ERROR_QUOTA":
+            st.error("⚠️ API Quota Limit Hit (429).")
+            st.warning("Please wait 60 seconds, then click 'Reset Connection' in the sidebar.")
+            st.stop()
+        elif model_name == "ERROR_KEY":
+            st.error("❌ Invalid API Key.")
+            st.stop()
+        elif "ERROR" in model_name:
+            st.error(f"❌ Connection Failed: {model_name}")
+            st.stop()
+        
+        st.success(f"Connected to: {model_name}")
+
+    # 2. LOAD VECTORS
     with st.spinner("Loading Vector Model..."):
         try: _ = load_gemma_model(hf_token)
         except: st.stop()
 
+    # 3. STRATEGY
     with st.spinner("Analyzing Cultural Context..."):
-        strategy = get_cultural_translation(api_key, keyword)
+        strategy = get_cultural_translation(api_key, model_name, keyword)
         
-        if not strategy: st.error("No response."); st.stop()
-        if "error" in strategy:
-            st.error(strategy['error'])
+        if not strategy or "error" in strategy:
+            st.error(f"Generation Error: {strategy.get('error')}")
             st.stop()
             
         st.session_state.synonyms = strategy.get('synonyms', [])
         st.session_state.strategy_text = strategy.get('explanation', '')
 
+    # 4. MINE
     df = deep_mine(st.session_state.synonyms)
     
     if not df.empty:
@@ -231,7 +244,7 @@ if run_btn and keyword and api_key and hf_token:
         if df_filtered is not None and not df_filtered.empty:
             with st.spinner("Translating..."):
                 top = df_filtered.head(30)['German Keyword'].tolist()
-                trans_map = batch_translate(api_key, top)
+                trans_map = batch_translate(api_key, model_name, top)
                 df_filtered['English'] = df_filtered['German Keyword'].map(trans_map).fillna("-")
             
             st.session_state.df_results = df_filtered
