@@ -70,76 +70,58 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     return df_relevant.sort_values('Relevance', ascending=False)
 
 # -----------------------------------------------------------------------------
-# 4. GENERATIVE ENGINE (CACHED DYNAMIC DISCOVERY)
+# 4. GENERATIVE ENGINE (SMART FALLBACK - NO OVERHEAD)
 # -----------------------------------------------------------------------------
-
-# CACHED FUNCTION: This only runs ONCE per session to find the right model name.
-# It solves the 404 error (by getting the exact name) and the Quota error (by not repeating).
-@st.cache_data(show_spinner="Connecting to Google AI...", ttl=3600)
-def get_valid_gemini_model(api_key):
-    genai.configure(api_key=api_key)
-    try:
-        # Ask Google for available models
-        models = list(genai.list_models())
-        
-        # Filter for text generation models
-        valid_models = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        
-        if not valid_models:
-            return None
-
-        # Intelligent Selection
-        # 1. Prefer Flash (Fastest)
-        for m in valid_models:
-            if 'flash' in m and '1.5' in m: return m
-        # 2. Prefer 1.5 Pro
-        for m in valid_models:
-            if 'pro' in m and '1.5' in m: return m
-        # 3. Fallback to whatever is available (e.g., gemini-1.0-pro)
-        return valid_models[0]
-
-    except Exception as e:
-        # If listing fails, we return None and handle it in the main function
-        return None
-
 def run_gemini(api_key, prompt, retries=0):
-    if retries > 3:
-        return {"error": "⚠️ API Quota Exceeded. Please wait 1 minute."}
-
-    # 1. Get the correct model name (Cached)
-    model_name = get_valid_gemini_model(api_key)
-    
-    # Emergency fallback if cache/discovery failed entirely
-    if not model_name:
-        # Try a very standard name that often works even if listing fails
-        model_name = "models/gemini-1.5-flash-latest"
+    # If we've retried multiple times, stop to prevent endless waiting
+    if retries > 2:
+        return {"error": "⚠️ API Quota Exceeded. Please wait 1-2 minutes and try again."}
 
     genai.configure(api_key=api_key)
     
-    try:
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(prompt)
-        
-        # Clean JSON
-        text = re.sub(r"```json|```", "", response.text).strip()
-        return json.loads(text)
+    # PRIORITY LIST:
+    # 1. Flash: Fastest, highest limits (15 RPM free).
+    # 2. Flash-001: Alternative name.
+    # 3. Pro: Lower limits (2 RPM free), used as fallback.
+    candidates = [
+        "models/gemini-1.5-flash",
+        "models/gemini-1.5-flash-001",
+        "models/gemini-1.5-pro",
+        "models/gemini-pro"
+    ]
+    
+    last_error = None
+    
+    for model_name in candidates:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            
+            # If successful, clean and return
+            text = re.sub(r"```json|```", "", response.text).strip()
+            return json.loads(text)
 
-    except Exception as e:
-        last_error = str(e)
-        
-        # Rate Limit (429) -> Wait and Retry
-        if "429" in last_error:
-            time.sleep(5) 
-            return run_gemini(api_key, prompt, retries=retries+1)
-        
-        # If 404, it means our fallback guessed wrong.
-        # But since we used dynamic discovery, this is rare.
-        if "404" in last_error and retries == 0:
-             # Clear cache and try again once (maybe permissions changed)
-             get_valid_gemini_model.clear()
-             return run_gemini(api_key, prompt, retries=retries+1)
+        except Exception as e:
+            last_error = str(e)
+            
+            # CASE A: RATE LIMIT (429)
+            # We must wait significantly longer (10s) for the free tier bucket to drain
+            if "429" in last_error:
+                time.sleep(10)
+                # Retry the function (it will restart the loop, likely trying Flash again)
+                return run_gemini(api_key, prompt, retries=retries+1)
+            
+            # CASE B: MODEL NOT FOUND (404)
+            # This is fine, just loop to the next model in 'candidates'
+            if "404" in last_error or "not found" in last_error.lower():
+                continue
+                
+            # CASE C: INVALID KEY
+            if "API key" in last_error or "403" in last_error:
+                return {"error": "Invalid API Key."}
 
-        return {"error": f"AI Error ({model_name}): {last_error}"}
+    # If all models failed
+    return {"error": f"Unable to access Google AI. Last error: {last_error}"}
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
@@ -155,6 +137,7 @@ def get_cultural_translation(api_key, keyword):
 
 def batch_translate(api_key, keywords):
     if not keywords: return {}
+    # Chunking: 40 keywords per call
     chunks = [keywords[i:i+40] for i in range(0, len(keywords), 40)]
     full_map = {}
     for chunk in chunks:
@@ -162,7 +145,7 @@ def batch_translate(api_key, keywords):
         Return JSON: {{ "German": "English" }}"""
         res = run_gemini(api_key, prompt)
         if "error" not in res: full_map.update(res)
-        time.sleep(1)
+        time.sleep(2) # Polite delay between batch chunks
     return full_map
 
 # -----------------------------------------------------------------------------
@@ -197,7 +180,7 @@ def deep_mine(synonyms):
             
             for r in results:
                 all_data.append({"German Keyword": r, "Seed": seed, "Intent": intent})
-            time.sleep(0.05)
+            time.sleep(0.05) # Polite scraping delay
             
     prog.empty()
     df = pd.DataFrame(all_data)
@@ -237,8 +220,6 @@ if run_btn and keyword and api_key and hf_token:
             st.stop()
         if "error" in strategy:
             st.error(f"{strategy['error']}")
-            # Hint for the user if it's still failing
-            st.warning("If you see a 404 error, your API Key might not have access to 'Flash' or 'Pro' models. Check your Google AI Studio settings.")
             st.stop()
             
         st.session_state.synonyms = strategy.get('synonyms', [])
@@ -253,7 +234,7 @@ if run_btn and keyword and api_key and hf_token:
             df_filtered = process_keywords_gemma(df, st.session_state.synonyms, threshold, hf_token)
             
         if df_filtered is not None and not df_filtered.empty:
-            # 5. Translate (Top 30)
+            # 5. Translate (Limit to Top 30)
             with st.spinner("Translating Top Results..."):
                 top_keywords = df_filtered.head(30)['German Keyword'].tolist()
                 trans_map = batch_translate(api_key, top_keywords)
