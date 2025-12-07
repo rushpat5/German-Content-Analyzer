@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 # -----------------------------------------------------------------------------
-# 1. VISUAL CONFIGURATION (Strict Dejan Style)
+# 1. VISUAL CONFIGURATION
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="German SEO Planner", layout="wide", page_icon="🇩🇪")
 
@@ -54,11 +54,12 @@ if 'data_processed' not in st.session_state:
 def load_gemma_model(hf_token):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
-        # Using 'use_auth_token' for compatibility
-        return SentenceTransformer("google/embeddinggemma-300m", use_auth_token=hf_token).to(device)
+        # Updated 'use_auth_token' to 'token' for newer library versions
+        return SentenceTransformer("google/embeddinggemma-300m", token=hf_token).to(device)
     except Exception as e:
-        st.error(f"Gemma Load Error: {e}")
-        return None
+        # Fallback to a standard model if Gemma fails (to prevent app crash)
+        st.error(f"Gemma Load Error: {e}. Falling back to standard model.")
+        return SentenceTransformer("all-MiniLM-L6-v2")
 
 def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     model = load_gemma_model(hf_token)
@@ -70,6 +71,7 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
         candidates = df_keywords['German Keyword'].tolist()
         candidate_vecs = model.encode(candidates, prompt_name="STS", normalize_embeddings=True)
     except TypeError:
+        # Fallback for models that don't support prompts
         seed_vecs = model.encode(seeds, normalize_embeddings=True)
         candidates = df_keywords['German Keyword'].tolist()
         candidate_vecs = model.encode(candidates, normalize_embeddings=True)
@@ -82,7 +84,7 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     # Filter noise
     df_relevant = df_keywords[df_keywords['Relevance'] >= threshold].copy()
     
-    # --- B. SPLITTING (Adjusted Threshold to 0.65) ---
+    # --- B. SPLITTING ---
     df_direct = df_relevant[df_relevant['Relevance'] > 0.65].copy()
     df_clusters = df_relevant[df_relevant['Relevance'] <= 0.65].copy()
     
@@ -101,8 +103,9 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
         cluster_names = {}
         for cid in np.unique(cluster_ids):
             subset = df_clusters[df_clusters['Cluster ID'] == cid]
-            head_term = sorted(subset['German Keyword'].tolist(), key=len)[0]
-            cluster_names[cid] = head_term.title()
+            if not subset.empty:
+                head_term = sorted(subset['German Keyword'].tolist(), key=len)[0]
+                cluster_names[cid] = head_term.title()
         df_clusters['Cluster Name'] = df_clusters['Cluster ID'].map(cluster_names)
     else:
         df_clusters['Cluster Name'] = "General"
@@ -111,23 +114,31 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     return df_direct.sort_values('Relevance', ascending=False), df_clusters.sort_values('Cluster ID')
 
 # -----------------------------------------------------------------------------
-# 4. GENERATIVE ENGINE
+# 4. GENERATIVE ENGINE (FIXED LOOP)
 # -----------------------------------------------------------------------------
-def run_gemini(api_key, prompt):
+def run_gemini(api_key, prompt, retries=0):
+    if retries > 3:
+        return {"error": "Max retries exceeded (API Quota or 429 Error)"}
+        
     genai.configure(api_key=api_key)
     try:
-        models = list(genai.list_models())
-        valid = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        # Priority: Flash -> Pro
-        chosen = next((m for m in valid if 'flash' in m), next((m for m in valid if 'pro' in m), "models/gemini-1.5-flash"))
-        
-        model = genai.GenerativeModel(chosen)
+        # Skip listing models (it's slow), default to Flash 
+        model = genai.GenerativeModel("models/gemini-1.5-flash")
         response = model.generate_content(prompt)
-        text = response.text.replace("```json", "").replace("```", "").strip()
+        
+        # Clean JSON string
+        text = response.text
+        text = re.sub(r"```json", "", text)
+        text = re.sub(r"```", "", text)
+        text = text.strip()
+        
         return json.loads(text)
     except Exception as e:
-        if "429" in str(e): time.sleep(1); return run_gemini(api_key, prompt)
-        return {"error": str(e)}
+        error_str = str(e)
+        if "429" in error_str: 
+            time.sleep(2)
+            return run_gemini(api_key, prompt, retries=retries+1)
+        return {"error": error_str}
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
@@ -139,20 +150,21 @@ def get_cultural_translation(api_key, keyword):
     2. The formal/medical term.
     3. A popular synonym.
     
-    Return JSON: {{ "synonyms": ["term1", "term2", "term3"], "explanation": "Reasoning" }}
+    Return STRICT JSON: {{ "synonyms": ["term1", "term2", "term3"], "explanation": "Reasoning" }}
     """
     return run_gemini(api_key, prompt)
 
 def batch_translate(api_key, keywords):
     if not keywords: return {}
-    chunks = [keywords[i:i+50] for i in range(0, len(keywords), 50)]
+    # Reduced chunk size to prevent API timeouts
+    chunks = [keywords[i:i+30] for i in range(0, len(keywords), 30)]
     full_map = {}
     for chunk in chunks:
         prompt = f"""Translate German to English (Literal): {json.dumps(chunk)}. 
         Return JSON: {{ "German": "English" }}"""
         res = run_gemini(api_key, prompt)
         if "error" not in res: full_map.update(res)
-        time.sleep(0.2)
+        time.sleep(0.5)
     return full_map
 
 def generate_brief(api_key, cluster_name, keywords):
@@ -189,15 +201,15 @@ def deep_mine(synonyms):
     
     for seed in synonyms:
         for mod in modifiers:
-            step += 1; prog.progress(min(step/total, 1.0), f"Mining: {seed}{mod}...")
+            step += 1; 
+            if total > 0: prog.progress(min(step/total, 1.0), f"Mining: {seed}{mod}...")
+            
             results = fetch_suggestions(f"{seed}{mod}")
             
-            # --- INTENT LOGIC ADDED ---
             intent = "Informational"
             if "kaufen" in mod: intent = "Transactional"
             elif "gegen" in mod: intent = "Solution"
             elif "hausmittel" in mod: intent = "DIY/Remedy"
-            # ---------------------------
             
             for r in results:
                 all_data.append({"German Keyword": r, "Seed": seed, "Intent": intent})
@@ -209,17 +221,22 @@ def deep_mine(synonyms):
     return df
 
 def fetch_smart_trends(df_keywords):
-    candidates = df_keywords.sort_values(by="German Keyword", key=lambda x: x.str.len()).head(10)['German Keyword'].tolist()
+    # Limit trends to top 5 to avoid timeouts
+    candidates = df_keywords.sort_values(by="German Keyword", key=lambda x: x.str.len()).head(5)['German Keyword'].tolist()
     trend_map = {}
     try:
         pytrends = TrendReq(hl='de-DE', tz=360)
-        pytrends.build_payload(candidates[:5], cat=0, timeframe='today 3-m', geo='DE')
-        data = pytrends.interest_over_time()
-        if not data.empty:
-            means = data.mean()
-            for kw in candidates[:5]:
-                if kw in means: trend_map[kw] = int(means[kw])
-    except: pass
+        # Handle empty lists
+        if candidates:
+            pytrends.build_payload(candidates, cat=0, timeframe='today 3-m', geo='DE')
+            data = pytrends.interest_over_time()
+            if not data.empty:
+                means = data.mean()
+                for kw in candidates:
+                    if kw in means: trend_map[kw] = int(means[kw])
+    except Exception as e: 
+        print(f"Trend Error: {e}")
+        pass
     return trend_map
 
 # -----------------------------------------------------------------------------
@@ -236,7 +253,7 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     
     st.markdown("---")
-    threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.50, 0.05)
+    threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.40, 0.05)
     
     st.markdown("""
     <div class="tech-note">
@@ -258,8 +275,11 @@ if run_btn and keyword and api_key and hf_token:
 
     # 0. Load Model (Cached)
     with st.spinner("Initializing Google Gemma Model (300M)..."):
-        try: _ = load_gemma_model(hf_token)
-        except: st.stop()
+        try: 
+            _ = load_gemma_model(hf_token)
+        except Exception as e:
+            st.error(f"Failed to load Gemma. Check your HF Token. Error: {e}")
+            st.stop()
 
     # 1. Strategy
     with st.spinner("Linguistic Analysis (Gemini)..."):
@@ -276,10 +296,10 @@ if run_btn and keyword and api_key and hf_token:
     if not df.empty:
         # 3. Filter & Cluster (Using Vector Model)
         with st.spinner("Vector Filtering & Clustering..."):
-            # Pass HF Token to process function
             df_direct, df_clustered = process_keywords_gemma(df, st.session_state.synonyms, threshold, hf_token)
             
             if df_direct is None: 
+                st.error("Error processing vectors.")
                 st.stop()
             
         # 4. Translate
@@ -288,6 +308,7 @@ if run_btn and keyword and api_key and hf_token:
             if not df_direct.empty: all_kws.extend(df_direct['German Keyword'].tolist())
             if not df_clustered.empty: all_kws.extend(df_clustered['German Keyword'].tolist())
             
+            # De-duplicate to save tokens
             trans_map = batch_translate(api_key, list(set(all_kws)))
             
             if not df_direct.empty:
@@ -295,8 +316,11 @@ if run_btn and keyword and api_key and hf_token:
             
             if not df_clustered.empty:
                 df_clustered['English'] = df_clustered['German Keyword'].map(trans_map).fillna("-")
-                trends = fetch_smart_trends(df_clustered)
-                df_clustered['Trend'] = df_clustered['German Keyword'].map(trends).fillna("-")
+                
+                # Trends (Optional - might be slow)
+                # trends = fetch_smart_trends(df_clustered)
+                # df_clustered['Trend'] = df_clustered['German Keyword'].map(trends).fillna("-")
+                df_clustered['Trend'] = "-" # Disabled for speed
 
         st.session_state.df_direct = df_direct
         st.session_state.df_clustered = df_clustered
@@ -308,9 +332,12 @@ if run_btn and keyword and api_key and hf_token:
 if st.session_state.data_processed:
     
     st.info(f"**Cultural Context:** {st.session_state.strategy_text}")
-    cols = st.columns(len(st.session_state.synonyms))
-    for i, syn in enumerate(st.session_state.synonyms):
-        cols[i].markdown(f"""<div class="metric-card"><div class="metric-val">{syn}</div></div>""", unsafe_allow_html=True)
+    
+    if st.session_state.synonyms:
+        cols = st.columns(len(st.session_state.synonyms))
+        for i, syn in enumerate(st.session_state.synonyms):
+            if i < len(cols):
+                cols[i].markdown(f"""<div class="metric-card"><div class="metric-val">{syn}</div></div>""", unsafe_allow_html=True)
     
     st.write("---")
     
@@ -361,7 +388,7 @@ if st.session_state.data_processed:
                             st.caption(f"({b.get('h1_english')})")
                             for s in b.get('outline', []):
                                 st.markdown(f"- {s.get('h2')}")
-                        else: st.error("Failed.")
+                        else: st.error("Failed to generate brief.")
 
         st.markdown("---")
         csv = st.session_state.df_clustered.to_csv(index=False).encode('utf-8')
