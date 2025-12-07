@@ -11,7 +11,7 @@ import torch
 # -----------------------------------------------------------------------------
 # 1. VISUAL CONFIGURATION
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="German SEO Planner (Groq)", layout="wide", page_icon="🇩🇪")
+st.set_page_config(page_title="German SEO Planner (Llama 3.3)", layout="wide", page_icon="🇩🇪")
 
 st.markdown("""
 <style>
@@ -37,6 +37,7 @@ if 'data_processed' not in st.session_state:
     st.session_state.df_results = None
     st.session_state.synonyms = []
     st.session_state.strategy_text = ""
+    st.session_state.working_groq_model = None # Memory for the working model
 
 # -----------------------------------------------------------------------------
 # 3. VECTOR ENGINE (Google Gemma via HuggingFace)
@@ -45,7 +46,6 @@ if 'data_processed' not in st.session_state:
 def load_gemma_model(hf_token):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
-        # We keep Gemma for vectors because it's excellent for semantic matching
         return SentenceTransformer("google/embeddinggemma-300m", token=hf_token).to(device)
     except Exception as e:
         return SentenceTransformer("all-MiniLM-L6-v2")
@@ -70,37 +70,76 @@ def process_keywords_gemma(df_keywords, seeds, threshold, hf_token):
     return df_keywords[df_keywords['Relevance'] >= threshold].sort_values('Relevance', ascending=False)
 
 # -----------------------------------------------------------------------------
-# 4. GENERATIVE ENGINE (GROQ - Llama 3)
+# 4. GENERATIVE ENGINE (GROQ - SELF HEALING)
 # -----------------------------------------------------------------------------
 def run_groq(api_key, prompt):
     client = Groq(api_key=api_key)
     
-    try:
-        # Llama 3 70B is the "Smart" model. 8B is the "Fast" model.
-        # We use 70B for quality.
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful SEO assistant. Output strict JSON only."
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-            model="llama3-70b-8192", 
-            temperature=0.1,
-            response_format={"type": "json_object"} # CRITICAL: Prevents parsing errors
-        )
-        
-        return json.loads(chat_completion.choices[0].message.content)
+    # PRIORITY LIST (Newest to Oldest)
+    # If one is decommissioned, it automatically tries the next one.
+    candidates = [
+        "llama-3.3-70b-versatile",   # Best current model (Dec 2024/Jan 2025)
+        "llama-3.1-70b-versatile",   # Previous Standard
+        "llama-3.2-90b-vision-preview", # Strong alternative
+        "llama-3.1-8b-instant"       # Fastest / Backup
+    ]
+    
+    # Use cached model if we found one already
+    if st.session_state.working_groq_model:
+        candidates.insert(0, st.session_state.working_groq_model)
+    
+    # Remove duplicates
+    candidates = list(dict.fromkeys(candidates))
 
-    except Exception as e:
-        error_msg = str(e)
-        if "401" in error_msg: return {"error": "INVALID_KEY"}
-        if "429" in error_msg: return {"error": "RATE_LIMIT"}
-        return {"error": f"GROQ_ERR: {error_msg}"}
+    last_error = None
+
+    for model_name in candidates:
+        try:
+            chat_completion = client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a helpful SEO assistant. Output strict JSON only."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                model=model_name,
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            
+            # If it worked, save this model as the "Working" one
+            st.session_state.working_groq_model = model_name
+            return json.loads(chat_completion.choices[0].message.content)
+
+        except Exception as e:
+            last_error = str(e)
+            
+            # If Decommissioned (400) or Not Found (404), continue to next model
+            if "404" in last_error or "400" in last_error or "decommissioned" in last_error:
+                continue
+            
+            # If Rate Limit (429), wait and retry ONCE on the same model
+            if "429" in last_error:
+                time.sleep(2)
+                try:
+                    chat_completion = client.chat.completions.create(
+                         messages=[{"role": "user", "content": prompt}],
+                         model=model_name, temperature=0.1, response_format={"type": "json_object"}
+                    )
+                    st.session_state.working_groq_model = model_name
+                    return json.loads(chat_completion.choices[0].message.content)
+                except:
+                    continue # Move to next model if retry fails
+
+            # Invalid Key
+            if "401" in last_error:
+                return {"error": "INVALID_KEY"}
+                
+    return {"error": f"All Groq models failed. Last error: {last_error}"}
 
 def get_cultural_translation(api_key, keyword):
     prompt = f"""
@@ -185,6 +224,9 @@ with st.sidebar:
     st.markdown("---")
     threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.45, 0.05)
     
+    if st.session_state.working_groq_model:
+        st.success(f"Using: {st.session_state.working_groq_model}")
+
     # Check if Groq lib is installed
     try:
         import groq
@@ -192,7 +234,7 @@ with st.sidebar:
     except ImportError:
         st.markdown('<span class="status-badge status-err">⚠ Groq Missing in requirements.txt</span>', unsafe_allow_html=True)
 
-st.title("German SEO Planner 🇩🇪 (Llama 3)")
+st.title("German SEO Planner 🇩🇪 (Llama 3.3)")
 st.markdown("### High-Speed Semantic Keyword Discovery")
 
 keyword = st.text_input("Enter English Topic", placeholder="e.g. coffee machines")
@@ -206,8 +248,8 @@ if run_btn and keyword and api_key and hf_token:
         try: _ = load_gemma_model(hf_token)
         except: st.stop()
 
-    # 2. STRATEGY (Llama 3)
-    with st.spinner("Analyzing Cultural Context (Llama 3)..."):
+    # 2. STRATEGY (Llama 3.3)
+    with st.spinner("Analyzing Cultural Context (Llama 3.3)..."):
         strategy = get_cultural_translation(api_key, keyword)
         
         # ERROR HANDLING
@@ -215,7 +257,6 @@ if run_btn and keyword and api_key and hf_token:
         if "error" in strategy:
             err = strategy['error']
             if err == "INVALID_KEY": st.error("❌ Invalid Groq API Key."); st.stop()
-            if err == "RATE_LIMIT": st.error("⚠️ Rate Limit Hit. Wait a moment."); st.stop()
             st.error(f"Error: {err}")
             st.stop()
             
