@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # STREAMLIT UI THEME IMPROVED
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="German SEO Planner",
+    page_title="Keyword Planner",
     layout="wide",
     page_icon="🇩🇪"
 )
@@ -297,8 +297,8 @@ with st.sidebar:
 # ---------------------------------------------------------
 # MAIN UI
 # ---------------------------------------------------------
-st.title("German SEO Planner 🇩🇪")
-st.markdown("#### High-Speed Semantic Keyword Discovery (Refined UI)")
+st.title("Keyword Planner 🇩🇪")
+st.markdown("#### Semantic Keyword Discovery")
 
 keyword = st.text_input("Enter English Topic")
 run_btn = st.button("Generate Keywords")
@@ -374,3 +374,4 @@ if st.session_state.data_processed:
             )
         }
     )
+
