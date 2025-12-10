@@ -238,7 +238,7 @@ def deep_mine(synonyms: List[str]) -> pd.DataFrame:
     modifiers = [
         "",
         " symptome", " ursachen", " anzeichen",
-        " was tun", " hausmittel", " bilder",
+        " was tun", " hausmittel",
         " test", " erfahrung", " vergleich"
     ]
 
@@ -457,3 +457,4 @@ if st.session_state.data_processed and st.session_state.df_results is not None:
             )
         }
     )
+
