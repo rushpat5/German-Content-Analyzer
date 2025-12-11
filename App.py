@@ -236,11 +236,13 @@ def fetch_suggestions(q: str) -> List[str]:
 
 def deep_mine(synonyms: List[str]) -> pd.DataFrame:
     modifiers = [
-        "",
-        " symptome", " ursachen", " anzeichen",
-        " was tun", " hausmittel",
-        " test", " erfahrung", " vergleich"
-    ]
+    "",
+    " tipps",        # how-to / parenting tips (high volume)
+    " anleitung",    # instructions / how-to (practical)
+    " erfahrungen",  # real parent experience (social proof)
+    " bewertungen",  # reviews / ratings (decision intent)
+    " vergleich"     # product/brand comparisons
+]
 
     rows = []
     total = max(len(synonyms) * len(modifiers), 1)
@@ -457,4 +459,5 @@ if st.session_state.data_processed and st.session_state.df_results is not None:
             )
         }
     )
+
 
