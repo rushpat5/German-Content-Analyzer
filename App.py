@@ -12,72 +12,53 @@ from groq import Groq
 from sentence_transformers import SentenceTransformer, util
 
 # ---------------------------------------------------------
-# LOGGING
+# CONFIG & STYLE
 # ---------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------
-# STREAMLIT UI THEME IMPROVED
-# ---------------------------------------------------------
-st.set_page_config(
-    page_title="Keyword Planner",
-    layout="wide",
-    page_icon="🇩🇪"
-)
+st.set_page_config(page_title="Everyday User Prompts (DE)", layout="wide", page_icon="🗣️")
 
 st.markdown(
     """
     <style>
-        :root {
-            --brand: #2b6cb0;
-            --brand-light: #d9eafe;
-            --bg: #ffffff;
-            --text: #1a202c;
-            --border: #e2e8f0;
-        }
-
-        .stApp {
-            background-color: var(--bg);
-            color: var(--text);
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            padding: 0;
-        }
-
-        section[data-testid="stSidebar"] {
-            background-color: #f8fafc;
-            border-right: 1px solid var(--border);
-        }
-
-        .metric-box {
-            background: var(--brand-light);
+        :root { --brand: #3182ce; --bg: #ffffff; }
+        .stApp { background-color: var(--bg); font-family: sans-serif; }
+        
+        .user-bubble {
+            background: #eebbbb; /* Light Red/Pink for User */
             padding: 12px 18px;
-            border-radius: 8px;
-            border: 1px solid var(--brand);
-            font-size: 1.1rem;
-            font-weight: 600;
-            text-align: center;
-            color: var(--brand);
+            border-radius: 18px 18px 18px 0px;
+            margin-top: 5px;
+            color: #2c3e50;
+            font-size: 1.05rem;
+            font-weight: 500;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+            border: 1px solid #e2e8f0;
+        }
+        
+        .translation-text {
+            color: #718096;
+            font-size: 0.9rem;
+            font-style: italic;
+            margin-top: 6px;
+            margin-left: 5px;
+            display: flex;
+            align-items: center;
         }
 
-        .context-box {
-            background: #e6fffa;
-            border-left: 5px solid #38b2ac;
-            padding: 16px;
-            border-radius: 6px;
-            margin-bottom: 12px;
-            color: #234e52;
-            font-size: 1rem;
-            line-height: 1.5;
+        .intent-label {
+            font-size: 0.75rem;
+            color: #a0aec0;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 2px;
         }
 
-        .stButton > button {
-            background-color: var(--brand) !important;
-            color: white !important;
-            border-radius: 6px !important;
-            font-size: 1rem !important;
-            padding: 8px 18px !important;
-            border: none;
+        .container-box {
+            margin-bottom: 25px;
+            border-bottom: 1px solid #edf2f7;
+            padding-bottom: 15px;
         }
     </style>
     """,
@@ -85,380 +66,216 @@ st.markdown(
 )
 
 # ---------------------------------------------------------
-# SESSION STATE
-# ---------------------------------------------------------
-if "data_processed" not in st.session_state:
-    st.session_state.data_processed = False
-    st.session_state.df_results = None
-    st.session_state.synonyms = []
-    st.session_state.strategy_text = ""
-    st.session_state.working_groq_model = None
-    st.session_state.current_topic = ""
-
-# ---------------------------------------------------------
-# EMBEDDING MODEL
+# CACHED RESOURCES
 # ---------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_embedding_model(hf_token: Optional[str]):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if not hf_token:
-        logger.warning("Missing HF token. Falling back to MiniLM.")
-        return SentenceTransformer("all-MiniLM-L6-v2").to(device)
-
     try:
-        # Depending on sentence-transformers version, this may need use_auth_token instead of token.
-        return SentenceTransformer("google/embeddinggemma-300m", token=hf_token).to(device)
-    except Exception as e:
-        logger.warning(f"Failed loading Gemma ({e}). Using MiniLM fallback.")
-        return SentenceTransformer("all-MiniLM-L6-v2").to(device)
+        if hf_token:
+            return SentenceTransformer("google/embeddinggemma-300m", token=hf_token).to(device)
+    except:
+        pass
+    return SentenceTransformer("all-MiniLM-L6-v2").to(device)
 
-# ---------------------------------------------------------
-# GROQ CLIENT (CACHED)
-# ---------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_groq_client(api_key: str) -> Groq:
     return Groq(api_key=api_key)
 
 # ---------------------------------------------------------
-# GROQ WRAPPER WITH LIMITED RETRIES
+# GROQ WRAPPER
 # ---------------------------------------------------------
-def run_groq(api_key: str, prompt: str, max_retries_per_model: int = 2) -> Dict:
-    """
-    Call Groq chat.completions with:
-    - model fallback list
-    - limited retries on 429
-    Returns parsed JSON or {"error": "..."}.
-    """
+def run_groq(api_key: str, prompt: str) -> Dict:
     client = get_groq_client(api_key)
-
-    cand_models = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-70b-versatile",
-        "llama-3.2-90b-vision-preview",
-        "llama-3.1-8b-instant"
-    ]
-
-    # If we have a known-good model from this session, try it first
-    if st.session_state.working_groq_model:
-        cand_models.insert(0, st.session_state.working_groq_model)
-
-    last_error = None
-
-    for m in cand_models:
-        retries = 0
-        while retries <= max_retries_per_model:
-            try:
-                resp = client.chat.completions.create(
-                    messages=[
-                        {"role": "system", "content": "Return ONLY valid JSON."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    model=m,
-                    temperature=0.1,
-                    response_format={"type": "json_object"}
-                )
-                st.session_state.working_groq_model = m
-                content = resp.choices[0].message.content
-                return json.loads(content)
-            except Exception as e:
-                err_str = str(e)
-                last_error = err_str
-                logger.warning(f"Groq error on model {m}: {err_str}")
-
-                # invalid key -> fail fast
-                if "401" in err_str:
-                    return {"error": "INVALID_KEY"}
-
-                # Rate limit -> backoff & retry a few times
-                if "429" in err_str:
-                    retries += 1
-                    sleep_time = 2 * retries  # simple linear backoff
-                    logger.info(f"Rate limited. Retry {retries}/{max_retries_per_model} on {m} in {sleep_time}s.")
-                    time.sleep(sleep_time)
-                    continue
-
-                # Other errors -> give up on this model
-                break
-
-    return {"error": f"All models failed. Last error: {last_error}"}
+    # Using smaller/faster models for high throughput
+    models = ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile"]
+    
+    for m in models:
+        try:
+            resp = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "Return ONLY valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                model=m,
+                temperature=0.7, # Higher temp for natural language variation
+                response_format={"type": "json_object"}
+            )
+            return json.loads(resp.choices[0].message.content)
+        except Exception:
+            continue
+    return {"error": "API Error"}
 
 # ---------------------------------------------------------
-# CULTURAL TRANSLATION (GERMAN SYNONYMS + ENGLISH EXPLANATION)
+# 1. TRANSLATE & CONTEXTUALIZE TOPIC
 # ---------------------------------------------------------
-def get_cultural_translation(api_key: str, keyword: str) -> Dict:
+def get_german_context(api_key: str, topic: str) -> List[str]:
+    """Get simple German terms for the topic to seed the search."""
     prompt = f"""
-    Act as a German SEO expert.
-
-    English concept: "{keyword}"
-
-    Produce:
-    - 3 short, high-quality German search terms.
-    - Explanation in ENGLISH ONLY.
-
-    The explanation MUST be English. Do not output German in explanation.
-
-    Return STRICT JSON:
-    {{
-        "synonyms": ["term1", "term2", "term3"],
-        "explanation": "English explanation here."
-    }}
+    Translate the topic "{topic}" into 3 common German search terms used by everyday people.
+    Return JSON: {{ "terms": ["term1", "term2", "term3"] }}
     """
-
-    result = run_groq(api_key, prompt)
-    if "error" in result:
-        return result
-
-    syns = result.get("synonyms", [])
-    if isinstance(syns, str):
-        syns = [syns]
-
-    result["synonyms"] = [s.strip() for s in syns if isinstance(s, str)]
-    result["explanation"] = str(result.get("explanation", "")).strip()
-
-    return result
+    res = run_groq(api_key, prompt)
+    return res.get("terms", []) if "error" not in res else []
 
 # ---------------------------------------------------------
-# AUTOCOMPLETE MINING
+# 2. MINE "CHAT-STYLE" INTENTS
 # ---------------------------------------------------------
 def fetch_suggestions(q: str) -> List[str]:
     url = f"https://www.google.com/complete/search?client=chrome&q={q}&hl=de&gl=de"
     try:
-        # Small random delay to be polite
-        time.sleep(random.uniform(0.12, 0.28))
-        r = requests.get(url, timeout=2.2)
-        r.raise_for_status()
-        data = r.json()
-        return [x for x in data[1] if isinstance(x, str)]
-    except Exception as e:
-        logger.warning(f"Suggestion fetch failed for '{q}': {e}")
+        time.sleep(random.uniform(0.1, 0.2))
+        r = requests.get(url, timeout=2.0)
+        return [x for x in r.json()[1] if isinstance(x, str)]
+    except:
         return []
 
-def deep_mine(synonyms: List[str]) -> pd.DataFrame:
+def mine_conversational_intents(seeds: List[str]) -> pd.DataFrame:
+    # Modifiers that signal "Generative AI" usage (Help, Write, Explain, Ideas)
     modifiers = [
-    "",                       # keep original seed term
-    " was ist",              # what is
-    " wie funktioniert",     # how does … work
-    " wie macht man",        # how to
-    " warum",                # why
-    " tipps für",           # tips for (informational)
-    " häufige fragen",      # frequently asked questions
-    " problem lösen",       # solve problem
-    " erklärung",           # explanation
-]
-
+        " schreib mir", " erklär mir", " hilf mir",  # Action oriented
+        " ideen für", " beispiele für",             # Brainstorming
+        " was ist der unterschied", " zusammenfassung", # Info retrieval
+        " wie mache ich", " tipps gegen"            # How-to / Advice
+    ]
+    
     rows = []
-    total = max(len(synonyms) * len(modifiers), 1)
-    step = 0
-
-    prog = st.progress(0, "Mining Google Autocomplete...")
-
-    for s in synonyms:
+    prog = st.progress(0, "Mining everyday questions...")
+    
+    for i, s in enumerate(seeds):
         for m in modifiers:
-            step += 1
-            prog.progress(step / total)
-            query = f"{s}{m}"
+            prog.progress((i + 1) / len(seeds))
+            query = f"{s}{m}" 
             results = fetch_suggestions(query)
             for r in results:
-                rows.append({"German Keyword": r, "Seed": s})
-
+                rows.append({"Raw Search": r, "Topic": s})
+                
     prog.empty()
-
-    if not rows:
-        return pd.DataFrame(columns=["German Keyword", "Seed"])
-
-    df = pd.DataFrame(rows).drop_duplicates(subset=["German Keyword"])
-    return df.reset_index(drop=True)
+    if not rows: return pd.DataFrame()
+    return pd.DataFrame(rows).drop_duplicates(subset=["Raw Search"])
 
 # ---------------------------------------------------------
-# SEMANTIC RELEVANCE FILTER
+# 3. SIMULATE NATURAL USER PROMPTS (DUAL LANGUAGE)
 # ---------------------------------------------------------
-def process_keywords(df: pd.DataFrame, seeds: List[str], threshold: float, hf_token: Optional[str]) -> Optional[pd.DataFrame]:
-    if df is None or df.empty:
-        return None
-
-    model = load_embedding_model(hf_token)
-
-    candidates = df["German Keyword"].tolist()
-    seed_terms = list(seeds)
-
-    topic = st.session_state.current_topic
-    if topic:
-        seed_terms.append(topic)
-
-    try:
-        seed_vecs = model.encode(seed_terms, prompt_name="STS", normalize_embeddings=True)
-        cand_vecs = model.encode(candidates, prompt_name="STS", normalize_embeddings=True)
-    except TypeError:
-        seed_vecs = model.encode(seed_terms, normalize_embeddings=True)
-        cand_vecs = model.encode(candidates, normalize_embeddings=True)
-
-    sim = util.cos_sim(cand_vecs, seed_vecs)
-    max_sim, _ = torch.max(sim, dim=1)
-
-    out_df = df.copy()
-    out_df["Relevance"] = max_sim.cpu().numpy()
-
-    out_df = out_df[out_df["Relevance"] >= threshold].sort_values("Relevance", ascending=False)
-    return out_df if not out_df.empty else None
-
-# ---------------------------------------------------------
-# BATCH TRANSLATION VIA GROQ (REDUCED API CALLS)
-# ---------------------------------------------------------
-def batch_translate_keywords(api_key: str, keywords: List[str]) -> Dict[str, str]:
+def simulate_user_prompts(api_key: str, searches: List[str]) -> Dict[str, Dict[str, str]]:
     """
-    Translate many German keywords to English in as few Groq calls as possible.
-    Returns {german: english}.
+    Takes a search query and returns:
+    1. Natural German Prompt
+    2. English Translation
     """
-    if not keywords:
-        return {}
-
-    # Deduplicate while preserving order
-    unique_keywords = list(dict.fromkeys([k for k in keywords if isinstance(k, str) and k.strip()]))
-    translations: Dict[str, str] = {}
-
-    # Chunk to avoid overly long prompts
-    chunk_size = 30
-    for i in range(0, len(unique_keywords), chunk_size):
-        chunk = unique_keywords[i:i + chunk_size]
-
+    if not searches: return {}
+    
+    unique_searches = list(set(searches))
+    results = {}
+    chunk_size = 8 # Smaller chunks for better quality
+    
+    prog = st.progress(0, "Simulating user typing (and translating)...")
+    
+    for i in range(0, len(unique_searches), chunk_size):
+        chunk = unique_searches[i:i + chunk_size]
+        prog.progress(i / len(unique_searches))
+        
         prompt = f"""
-        You are a professional translator.
-
-        Translate the following German keywords into literal English (short, neutral phrases).
-
-        Return STRICT JSON of the form:
-        {{
-            "translations": {{
-                "german_keyword_1": "english translation 1",
-                "german_keyword_2": "english translation 2"
-            }}
+        You are simulating an average German user typing into ChatGPT.
+        
+        Task: 
+        1. Convert the Search Query into a NATURAL, CASUAL German Prompt ("Du"-form).
+        2. Provide an English translation of that prompt.
+        
+        Input (Search Query): "bewerbung schreiben hilfe"
+        Output Structure:
+        "bewerbung schreiben hilfe": {{
+            "german": "Kannst du mir helfen, eine Bewerbung zu schreiben? Ich weiß nicht, wie ich anfangen soll.",
+            "english": "Can you help me write a job application? I don't know how to start."
         }}
 
-        Keywords (JSON array):
-        {json.dumps(chunk, ensure_ascii=False)}
+        Convert these queries: {json.dumps(chunk, ensure_ascii=False)}
+
+        Return JSON: {{ "mapping": {{ "query_key": {{ "german": "...", "english": "..." }} }} }}
         """
-
+        
         res = run_groq(api_key, prompt)
-        if "error" in res:
-            logger.warning(f"Translation batch failed: {res['error']}")
-            continue
-
-        trans_block = res.get("translations", {})
-        if isinstance(trans_block, dict):
-            for g, e in trans_block.items():
-                if isinstance(g, str) and isinstance(e, str):
-                    translations[g] = e.strip() or "-"
-
-        # Small pause between batches to be gentle on rate limits
-        time.sleep(0.7)
-
-    return translations
+        if "error" not in res:
+            # Merge results
+            mapping = res.get("mapping", {})
+            results.update(mapping)
+            
+        time.sleep(0.5)
+        
+    prog.empty()
+    return results
 
 # ---------------------------------------------------------
-# SIDEBAR
+# UI MAIN
 # ---------------------------------------------------------
 with st.sidebar:
-    st.header("Engine Config")
+    st.header("Settings")
     api_key = st.text_input("Groq API Key", type="password")
-    hf_token = st.text_input("Hugging Face Token", type="password")
-    threshold = st.slider("Relevance Threshold", 0.0, 1.0, 0.45, 0.05)
+    hf_token = st.text_input("HF Token (Optional)", type="password")
+    num_results = st.slider("Number of Prompts", 5, 30, 10)
 
-# ---------------------------------------------------------
-# MAIN UI
-# ---------------------------------------------------------
-st.title("Keyword Planner 🇩🇪")
-st.markdown("#### Semantic Keyword Discovery")
+st.title("🗣️ Everyday User Prompts (German)")
+st.markdown("Discover how **real people** ask AI for help in your niche (with English translations).")
 
-keyword = st.text_input("Enter English Topic")
-run_btn = st.button("Generate Keywords")
-
-# ---------------------------------------------------------
-# PIPELINE EXECUTION
-# ---------------------------------------------------------
-if run_btn:
-    if not keyword.strip() or not api_key.strip() or not hf_token.strip():
-        st.error("Please provide topic, Groq API key, and HF token.")
+topic = st.text_input("Enter Topic (e.g., Cooking, Office, Dating)")
+if st.button("Generate User Prompts"):
+    if not api_key or not topic:
+        st.error("Need API Key and Topic.")
         st.stop()
-
-    st.session_state.current_topic = keyword.strip()
-    st.session_state.data_processed = False
-    st.session_state.df_results = None
-
-    with st.spinner("Loading embedding model…"):
-        _ = load_embedding_model(hf_token)
-
-    # 1. German synonyms + explanation
-    with st.spinner("Generating German synonyms…"):
-        strat = get_cultural_translation(api_key, keyword)
-        if "error" in strat:
-            msg = strat["error"]
-            if msg == "INVALID_KEY":
-                st.error("Invalid Groq API key.")
-            else:
-                st.error(f"Groq error: {msg}")
-            st.stop()
-
-        st.session_state.synonyms = strat.get("synonyms", [])
-        st.session_state.strategy_text = strat.get("explanation", "")
-
-    # 2. Google autocomplete mining
-    df_raw = deep_mine(st.session_state.synonyms)
+        
+    st.session_state.df = None
+    
+    # 1. Get German Context
+    seeds = get_german_context(api_key, topic)
+    if not seeds:
+        seeds = [topic]
+        
+    # 2. Mine Data
+    df_raw = mine_conversational_intents(seeds)
     if df_raw.empty:
-        st.warning("No keywords found from Google autocomplete.")
+        st.warning("No data found. Try a different topic.")
         st.stop()
+        
+    # 3. Filter Relevance
+    model = load_embedding_model(hf_token)
+    embeddings = model.encode(df_raw["Raw Search"].tolist())
+    topic_emb = model.encode(topic)
+    df_raw["Score"] = util.cos_sim(embeddings, topic_emb).cpu().numpy()
+    
+    # Take top N
+    df_top = df_raw.sort_values("Score", ascending=False).head(num_results)
+    
+    # 4. Humanize & Translate
+    human_map = simulate_user_prompts(api_key, df_top["Raw Search"].tolist())
+    
+    # Extract columns
+    df_top["German Prompt"] = df_top["Raw Search"].map(lambda x: human_map.get(x, {}).get("german", x))
+    df_top["English Translation"] = df_top["Raw Search"].map(lambda x: human_map.get(x, {}).get("english", "-"))
+    
+    # Remove failed generations
+    df_top = df_top[df_top["English Translation"] != "-"]
 
-    # 3. Semantic filtering
-    with st.spinner("Filtering by semantic relevance…"):
-        df_filtered = process_keywords(df_raw, st.session_state.synonyms, threshold, hf_token)
-        if df_filtered is None or df_filtered.empty:
-            st.warning("No relevant keywords above the threshold.")
-            st.stop()
-
-    # 4. Batch translation (Groq-friendly)
-    with st.spinner("Translating keywords…"):
-        german_keywords = df_filtered["German Keyword"].tolist()
-        translations_map = batch_translate_keywords(api_key, german_keywords)
-        df_filtered["English"] = df_filtered["German Keyword"].map(
-            lambda k: translations_map.get(k, "-")
-        )
-
-    st.session_state.df_results = df_filtered
-    st.session_state.data_processed = True
-
-# ---------------------------------------------------------
-# OUTPUT
-# ---------------------------------------------------------
-if st.session_state.data_processed and st.session_state.df_results is not None:
-    if st.session_state.strategy_text:
-        st.markdown(
-            f"<div class='context-box'>{st.session_state.strategy_text}</div>",
-            unsafe_allow_html=True
-        )
-
-    if st.session_state.synonyms:
-        cols = st.columns(len(st.session_state.synonyms))
-        for i, syn in enumerate(st.session_state.synonyms):
-            cols[i].markdown(
-                f"<div class='metric-box'>{syn}</div>",
-                unsafe_allow_html=True
-            )
-
-    df = st.session_state.df_results
-    csv = df.to_csv(index=False).encode("utf-8")
-
-    st.download_button("📥 Download CSV", csv, "keywords.csv", "text/csv")
-
-    st.dataframe(
-        df[["German Keyword", "English", "Relevance"]],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Relevance": st.column_config.ProgressColumn(
-                "Score",
-                format="%.2f",
-                min_value=0,
-                max_value=1
-            )
-        }
-    )
+    # Display Results
+    st.markdown("### 🇩🇪 What people are actually typing:")
+    st.markdown("---")
+    
+    for _, row in df_top.iterrows():
+        german = row['German Prompt']
+        english = row['English Translation']
+        raw_intent = row['Raw Search']
+        
+        st.markdown(f"""
+        <div class="container-box">
+            <div class='intent-label'>Original Search Intent: {raw_intent}</div>
+            <div class='user-bubble'>
+                User: <b>"{german}"</b>
+            </div>
+            <div class='translation-text'>
+                🇬🇧 "{english}"
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    # CSV Download
+    csv_data = df_top[["Raw Search", "German Prompt", "English Translation"]].to_csv(index=False).encode('utf-8')
+    st.download_button("📥 Download CSV (Bilingual)", csv_data, "user_prompts_bilingual.csv", "text/csv")
