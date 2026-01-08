@@ -68,7 +68,6 @@ st.markdown(
 # ---------------------------------------------------------
 # LANGUAGE CONFIGURATION
 # ---------------------------------------------------------
-# This dictionary maps the dropdown selection to search params and modifiers
 LANG_CONFIG = {
     "German (Germany)": {
         "hl": "de", "gl": "de", "llm_lang": "German",
@@ -103,6 +102,27 @@ LANG_CONFIG = {
         "modifiers": [
             " write me", " explain to me", " help me", " ideas for", 
             " examples of", " how to do", " tips for", " difference between"
+        ]
+    },
+    "English (India)": {
+        "hl": "en", "gl": "in", "llm_lang": "Indian English",
+        "modifiers": [
+            " how to", " help me", " tips for", " best way to", 
+            " explain", " ideas for", " examples of", " difference between",
+            " meaning in hindi" # Common Indian English query intent
+        ]
+    },
+    "Hindi (India)": {
+        "hl": "hi", "gl": "in", "llm_lang": "Hindi",
+        "modifiers": [
+             " कैसे करें",       # how to do
+             " क्या है",         # what is
+             " के फायदे",        # benefits of
+             " टिप्स",           # tips
+             " जानकारी",         # information
+             " का तरीका",        # way to
+             " उदाहरण",          # examples
+             " में मदद"          # help in
         ]
     }
 }
@@ -154,6 +174,7 @@ def get_localized_context(api_key: str, topic: str, target_lang: str) -> List[st
     """Get simple terms in the target language to seed the search."""
     prompt = f"""
     Translate the topic "{topic}" into 3 common {target_lang} search terms used by everyday people.
+    If the target is Hindi, provide the terms in Devanagari script.
     Return JSON: {{ "terms": ["term1", "term2", "term3"] }}
     """
     res = run_groq(api_key, prompt)
@@ -168,7 +189,6 @@ def fetch_suggestions(q: str, hl: str, gl: str) -> List[str]:
     try:
         time.sleep(random.uniform(0.1, 0.2))
         r = requests.get(url, timeout=2.0)
-        # Handle potential empty responses
         if r.status_code == 200 and len(r.json()) > 1:
             return [x for x in r.json()[1] if isinstance(x, str)]
         return []
@@ -199,7 +219,7 @@ def simulate_user_prompts(api_key: str, searches: List[str], target_lang: str) -
     """
     Takes a search query and returns:
     1. Natural Prompt in Target Language
-    2. English Translation (if target is English, it returns the same or a clean version)
+    2. English Translation
     """
     if not searches: return {}
     
@@ -220,10 +240,10 @@ def simulate_user_prompts(api_key: str, searches: List[str], target_lang: str) -
         1. Convert the Search Query into a NATURAL, CASUAL {target_lang} Prompt.
         2. Provide an English translation of that prompt (if the prompt is already English, provide the same text).
         
-        Input Example (if target was German):
-        "bewerbung schreiben hilfe" -> {{
-            "natural_prompt": "Kannst du mir helfen, eine Bewerbung zu schreiben? Ich weiß nicht, wie ich anfangen soll.",
-            "english": "Can you help me write a job application? I don't know how to start."
+        Input Example (if target was Hindi):
+        "biryani recipe hindi" -> {{
+            "natural_prompt": "मुझे चिकन बिरयानी बनाने की आसान विधि बताओ।",
+            "english": "Tell me an easy recipe to make Chicken Biryani."
         }}
 
         Convert these queries: {json.dumps(chunk, ensure_ascii=False)}
@@ -251,7 +271,7 @@ with st.sidebar:
     selected_lang_name = st.selectbox(
         "Select Target Language", 
         options=list(LANG_CONFIG.keys()),
-        index=0 # Defaults to German
+        index=0
     )
     
     # Retrieve config based on selection
@@ -295,7 +315,7 @@ if st.button("Generate User Prompts"):
     # 3. Filter Relevance
     model = load_embedding_model(hf_token)
     embeddings = model.encode(df_raw["Raw Search"].tolist())
-    topic_emb = model.encode(topic) # Embed the user input topic
+    topic_emb = model.encode(topic)
     df_raw["Score"] = util.cos_sim(embeddings, topic_emb).cpu().numpy()
     
     # Take top N
@@ -323,9 +343,6 @@ if st.button("Generate User Prompts"):
         prompt_text = row['Natural Prompt']
         english = row['English Translation']
         raw_intent = row['Raw Search']
-        
-        # UI Logic: If language is English, maybe don't emphasize translation as much,
-        # but for consistency we keep the design.
         
         st.markdown(f"""
         <div class="container-box">
