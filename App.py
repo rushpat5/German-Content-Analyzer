@@ -1,6 +1,7 @@
 import json
 import random
 import time
+import re
 import logging
 from typing import Optional, List, Dict
 
@@ -70,50 +71,50 @@ st.markdown(
 # ---------------------------------------------------------
 LANG_CONFIG = {
     "German (Germany)": {
-        "hl": "de", "gl": "de", "llm_lang": "German",
+        "hl": "de", "gl": "de", "llm_lang": "German", "region": "Germany", "filter_non_latin": False,
         "modifiers": [
             " schreib mir", " erklär mir", " hilf mir", " ideen für", 
             " beispiele für", " wie mache ich", " tipps gegen", " unterschied zwischen"
         ]
     },
     "French (France)": {
-        "hl": "fr", "gl": "fr", "llm_lang": "French",
+        "hl": "fr", "gl": "fr", "llm_lang": "French", "region": "France", "filter_non_latin": False,
         "modifiers": [
             " écris moi", " explique moi", " aide moi", " idées pour", 
             " exemples de", " comment faire", " conseils pour", " différence entre"
         ]
     },
     "Spanish (Spain)": {
-        "hl": "es", "gl": "es", "llm_lang": "Spanish",
+        "hl": "es", "gl": "es", "llm_lang": "Spanish", "region": "Spain", "filter_non_latin": False,
         "modifiers": [
             " escribe un", " explícame", " ayúdame", " ideas para", 
             " ejemplos de", " cómo hacer", " consejos para", " diferencia entre"
         ]
     },
     "English (UK)": {
-        "hl": "en", "gl": "gb", "llm_lang": "British English",
+        "hl": "en", "gl": "gb", "llm_lang": "British English", "region": "UK", "filter_non_latin": True,
         "modifiers": [
             " write me", " explain to me", " help me", " ideas for", 
             " examples of", " how to do", " tips for", " difference between"
         ]
     },
     "English (US)": {
-        "hl": "en", "gl": "us", "llm_lang": "American English",
+        "hl": "en", "gl": "us", "llm_lang": "American English", "region": "USA", "filter_non_latin": True,
         "modifiers": [
             " write me", " explain to me", " help me", " ideas for", 
             " examples of", " how to do", " tips for", " difference between"
         ]
     },
     "English (India)": {
-        "hl": "en", "gl": "in", "llm_lang": "Indian English",
+        "hl": "en", "gl": "in", "llm_lang": "Indian English", "region": "India", "filter_non_latin": True,
         "modifiers": [
-            " how to", " help me", " tips for", " best way to", 
-            " explain", " ideas for", " examples of", " difference between",
-            " meaning in hindi" # Common Indian English query intent
+            " how to", " tips for", " best way to", " procedure for",
+            " explain", " ideas for", " difference between", " fees of",
+            " apply for", " salary of" 
         ]
     },
     "Hindi (India)": {
-        "hl": "hi", "gl": "in", "llm_lang": "Hindi",
+        "hl": "hi", "gl": "in", "llm_lang": "Hindi", "region": "India", "filter_non_latin": False,
         "modifiers": [
              " कैसे करें",       # how to do
              " क्या है",         # what is
@@ -183,8 +184,12 @@ def get_localized_context(api_key: str, topic: str, target_lang: str) -> List[st
 # ---------------------------------------------------------
 # 2. MINE "CHAT-STYLE" INTENTS
 # ---------------------------------------------------------
+def is_latin_only(text: str) -> bool:
+    # Checks if text contains only Latin characters, numbers, and common punctuation
+    # This excludes Devanagari, Cyrillic, etc.
+    return not bool(re.search(r'[^\x00-\x7F\u00A0-\u00FF\u0100-\u017F\u2000-\u206F]', text))
+
 def fetch_suggestions(q: str, hl: str, gl: str) -> List[str]:
-    # Dynamic Google URL based on host language (hl) and geo-location (gl)
     url = f"https://www.google.com/complete/search?client=chrome&q={q}&hl={hl}&gl={gl}"
     try:
         time.sleep(random.uniform(0.1, 0.2))
@@ -195,7 +200,7 @@ def fetch_suggestions(q: str, hl: str, gl: str) -> List[str]:
     except:
         return []
 
-def mine_conversational_intents(seeds: List[str], modifiers: List[str], hl: str, gl: str) -> pd.DataFrame:
+def mine_conversational_intents(seeds: List[str], modifiers: List[str], hl: str, gl: str, filter_non_latin: bool) -> pd.DataFrame:
     rows = []
     prog = st.progress(0, "Mining everyday questions...")
     
@@ -205,7 +210,12 @@ def mine_conversational_intents(seeds: List[str], modifiers: List[str], hl: str,
         for m in modifiers:
             query = f"{s}{m}" 
             results = fetch_suggestions(query, hl, gl)
+            
             for r in results:
+                # Filter Logic for English (India) and others
+                if filter_non_latin and not is_latin_only(r):
+                    continue
+                    
                 rows.append({"Raw Search": r, "Topic": s})
                 
     prog.empty()
@@ -215,17 +225,18 @@ def mine_conversational_intents(seeds: List[str], modifiers: List[str], hl: str,
 # ---------------------------------------------------------
 # 3. SIMULATE NATURAL USER PROMPTS
 # ---------------------------------------------------------
-def simulate_user_prompts(api_key: str, searches: List[str], target_lang: str) -> Dict[str, Dict[str, str]]:
+def simulate_user_prompts(api_key: str, searches: List[str], lang_config: Dict) -> Dict[str, Dict[str, str]]:
     """
-    Takes a search query and returns:
-    1. Natural Prompt in Target Language
-    2. English Translation
+    Generates realistic, persona-based prompts.
     """
     if not searches: return {}
     
+    target_lang = lang_config['llm_lang']
+    region = lang_config.get('region', '')
+    
     unique_searches = list(set(searches))
     results = {}
-    chunk_size = 8
+    chunk_size = 5 # Smaller chunk size for higher quality focus
     
     prog = st.progress(0, f"Simulating user typing in {target_lang}...")
     
@@ -233,22 +244,33 @@ def simulate_user_prompts(api_key: str, searches: List[str], target_lang: str) -
         chunk = unique_searches[i:i + chunk_size]
         prog.progress(i / len(unique_searches))
         
+        # IMPROVED SYSTEM PROMPT
         prompt = f"""
-        You are simulating an average {target_lang} user typing into an AI Assistant.
+        You are an expert at simulating REAL user behavior in {region}.
         
-        Task: 
-        1. Convert the Search Query into a NATURAL, CASUAL {target_lang} Prompt.
-        2. Provide an English translation of that prompt (if the prompt is already English, provide the same text).
+        Task: Convert Search Queries into realistic, casual Chatbot Prompts.
         
-        Input Example (if target was Hindi):
-        "biryani recipe hindi" -> {{
-            "natural_prompt": "मुझे चिकन बिरयानी बनाने की आसान विधि बताओ।",
-            "english": "Tell me an easy recipe to make Chicken Biryani."
+        Target Language: {target_lang} (STRICTLY)
+        
+        Guidelines:
+        1. **CASUAL & DIRECT**: Real users don't say "Greetings AI, could you please...". They say "Write a...", "How do I...", "I have a doubt about...".
+        2. **REGIONAL NUANCE**:
+           - If English (India): Use Indianisms like "prepone", "doubt" (instead of question), "fees structure", "salary package". Keep it strictly English (No Hindi script).
+           - If German: Use "Du" (informal).
+        3. **IMPERFECTIONS**: It's okay to be short or grammatically loose, like a text message.
+        4. **TRANSLATION**: Provide a clear English translation.
+        
+        Input Queries: {json.dumps(chunk, ensure_ascii=False)}
+
+        Return JSON format: 
+        {{ 
+            "mapping": {{ 
+                "original_search_query": {{ 
+                    "natural_prompt": "The generated casual prompt", 
+                    "english": "English translation" 
+                }} 
+            }} 
         }}
-
-        Convert these queries: {json.dumps(chunk, ensure_ascii=False)}
-
-        Return JSON: {{ "mapping": {{ "query_key": {{ "natural_prompt": "...", "english": "..." }} }} }}
         """
         
         res = run_groq(api_key, prompt)
@@ -267,14 +289,12 @@ def simulate_user_prompts(api_key: str, searches: List[str], target_lang: str) -
 with st.sidebar:
     st.header("Settings")
     
-    # Language Selector
     selected_lang_name = st.selectbox(
         "Select Target Language", 
         options=list(LANG_CONFIG.keys()),
         index=0
     )
     
-    # Retrieve config based on selection
     current_config = LANG_CONFIG[selected_lang_name]
     
     api_key = st.text_input("Groq API Key", type="password")
@@ -282,9 +302,9 @@ with st.sidebar:
     num_results = st.slider("Number of Prompts", 5, 30, 10)
 
 st.title(f"🗣️ Everyday User Prompts ({selected_lang_name})")
-st.markdown(f"Discover how **real people** in **{current_config['llm_lang']}** ask AI for help (with English translations).")
+st.markdown(f"Discover how **real people** in **{current_config['region']}** ask AI for help.")
 
-topic = st.text_input(f"Enter Topic (e.g., Cooking, Office) - You can type in English or {current_config['llm_lang']}")
+topic = st.text_input(f"Enter Topic (e.g., Cooking, Office, python) - You can type in English or {current_config['llm_lang']}")
 
 if st.button("Generate User Prompts"):
     if not api_key or not topic:
@@ -293,23 +313,24 @@ if st.button("Generate User Prompts"):
         
     st.session_state.df = None
     
-    # 1. Get Context (Localized)
+    # 1. Get Context
     seeds = get_localized_context(api_key, topic, current_config['llm_lang'])
     if not seeds:
         seeds = [topic]
         
     st.write(f"🔎 *Searching using localized terms: {', '.join(seeds)}*")
 
-    # 2. Mine Data (with localized modifiers and Google params)
+    # 2. Mine Data
     df_raw = mine_conversational_intents(
         seeds, 
         current_config['modifiers'], 
         current_config['hl'], 
-        current_config['gl']
+        current_config['gl'],
+        current_config['filter_non_latin']
     )
     
     if df_raw.empty:
-        st.warning("No data found. Try a different topic.")
+        st.warning("No data found. Try a different topic or language settings.")
         st.stop()
         
     # 3. Filter Relevance
@@ -318,21 +339,19 @@ if st.button("Generate User Prompts"):
     topic_emb = model.encode(topic)
     df_raw["Score"] = util.cos_sim(embeddings, topic_emb).cpu().numpy()
     
-    # Take top N
     df_top = df_raw.sort_values("Score", ascending=False).head(num_results)
     
-    # 4. Humanize & Translate
+    # 4. Humanize
     human_map = simulate_user_prompts(
         api_key, 
         df_top["Raw Search"].tolist(), 
-        current_config['llm_lang']
+        current_config
     )
     
     # Extract columns
     df_top["Natural Prompt"] = df_top["Raw Search"].map(lambda x: human_map.get(x, {}).get("natural_prompt", x))
     df_top["English Translation"] = df_top["Raw Search"].map(lambda x: human_map.get(x, {}).get("english", "-"))
     
-    # Remove failed generations
     df_top = df_top[df_top["English Translation"] != "-"]
 
     # Display Results
@@ -358,4 +377,4 @@ if st.button("Generate User Prompts"):
         
     # CSV Download
     csv_data = df_top[["Raw Search", "Natural Prompt", "English Translation"]].to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download CSV (Bilingual)", csv_data, f"user_prompts_{current_config['hl']}.csv", "text/csv")
+    st.download_button("📥 Download CSV", csv_data, f"user_prompts_{current_config['hl']}.csv", "text/csv")
